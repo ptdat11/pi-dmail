@@ -19,8 +19,8 @@
  *
  *   Uncached. There is no fold state to lose. Records live in the session and are
  *   replayed from it, so folding survives resume and survives the extension being
- *   reloaded mid-session. The on/off toggle is the one piece of memory, and losing
- *   it only means the extension is on again.
+ *   reloaded mid-session. The session toggle is not persisted; a new session starts
+ *   from `dmail.enabled` in settings.json, defaulting to on.
  *
  * `/dmail` turns the whole thing off for the session: the tool is withdrawn, the
  * policy is withheld, and fold records stop being applied, so folded material comes
@@ -39,13 +39,16 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	type AgentMessage,
+	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	type ExtensionContext,
+	getAgentDir,
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { FOLD_TYPE, foldContext, numberSteps, type FoldRecord, type NumberedStep } from "./fold.ts";
+import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const POLICY_PATH = process.env.DMAIL_POLICY ?? join(HERE, "POLICY.md");
@@ -77,6 +80,26 @@ type BadgeTheme = {
 function onBlue(theme: BadgeTheme, text: string): string {
 	const background = theme.getFgAnsi("border").replace("\u001b[38;", "\u001b[48;");
 	return `${background}${text}\u001b[49m`;
+}
+
+/**
+ * Default mode comes from settings.json, so the one key D-Mail owns has a single
+ * place to be read and a single place to be documented.
+ */
+const SETTINGS_FILE = "settings.json";
+
+/**
+ * `--dmail-disabled` wins over settings, and settings win over the built-in on.
+ * A project that is not trusted is not read, matching how Pi itself treats
+ * `.pi/settings.json`.
+ */
+function configuredEnabled(ctx: ExtensionContext, flag: boolean | string | undefined): boolean {
+	if (flag === true) return false;
+	const globalText = readSettingsFile(join(getAgentDir(), SETTINGS_FILE));
+	const projectText = ctx.isProjectTrusted()
+		? readSettingsFile(join(ctx.cwd, CONFIG_DIR_NAME, SETTINGS_FILE))
+		: undefined;
+	return resolveDmailEnabled(globalText, projectText);
 }
 
 /**
@@ -154,7 +177,8 @@ function readFolds(entries: readonly SessionEntry[]): FoldRecord[] {
 
 export default function dmail(pi: ExtensionAPI): void {
 	// Session-local, deliberately. A toggle is not a setting, and it should not outlive
-	// the session that asked for it — the same choice bash-guard made.
+	// the session that asked for it — the same choice bash-guard made. The *starting*
+	// value is a setting (settings.json `dmail.enabled`); this only overrides it.
 	let enabled = true;
 	// True only while *we* are the ones hiding the tool, so that re-enabling does not
 	// hand SendDMail back to a user who had deliberately deactivated it.
@@ -190,7 +214,8 @@ export default function dmail(pi: ExtensionAPI): void {
 	};
 
 	pi.registerFlag("dmail-disabled", {
-		description: "Start the session with D-Mail disabled (folding off; /dmail re-enables it).",
+		description:
+			"Force D-Mail off for this session, overriding settings.json (folding off; /dmail re-enables it).",
 		type: "boolean",
 		default: false,
 	});
@@ -199,7 +224,7 @@ export default function dmail(pi: ExtensionAPI): void {
 		if (event.reason === "startup") {
 			// Registered name, no leading dashes: getFlag matches the name passed to
 			// registerFlag exactly, and returns undefined for anything else.
-			enabled = pi.getFlag("dmail-disabled") !== true;
+			enabled = configuredEnabled(ctx, pi.getFlag("dmail-disabled"));
 		}
 		applyToolVisibility();
 		paint(ctx);

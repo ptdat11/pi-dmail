@@ -34,14 +34,33 @@ is finished. What you get is a status badge in the footer and a command:
 
 - A blue **`D-MAIL ON`** badge when folding is active, a red **`⚠ D-MAIL OFF`** when it isn't.
 - `/dmail` — toggle folding for the session. Also accepts `/dmail on`, `/dmail off`, `/dmail status`.
-- `--dmail-disabled` — start a session with folding already off (`/dmail` turns it back on).
+- `--dmail-disabled` — force folding off for one session, overriding settings (`/dmail` turns it back on).
+- `dmail.enabled` in `settings.json` — the default mode for new sessions (`false` starts them off).
 
 Turning it off is a real escape hatch, not a cosmetic switch: the tool is withdrawn, the agent's folding
 instructions are withheld, and fold records stop being applied — so anything folded earlier comes back
 into context as the raw transcript. That is what to reach for if a summary turns out to have dropped
 something.
 
-The toggle is deliberately session-local. It does not outlive the session that asked for it.
+### Choosing the default mode
+
+New sessions start with folding **on**. To start them off instead, set the one key D-Mail owns in
+`~/.pi/agent/settings.json` (global) or `<project>/.pi/settings.json` (per project):
+
+```json
+{
+  "dmail": {
+    "enabled": false
+  }
+}
+```
+
+Project settings override global ones. Anything else — the key absent, unparseable JSON, or a
+non-boolean value — means on. `--dmail-disabled` overrides both, and `/dmail` overrides everything for
+the current session.
+
+The `/dmail` toggle stays deliberately session-local: it does not outlive the session that asked for
+it. Only the starting mode is read from settings.
 
 ## Why it's safe to let a model decide
 
@@ -51,8 +70,8 @@ Three properties, stated plainly, because they are what make this safe:
 untouched, so folding too much costs a re-read, not data.
 
 **Uncached.** There is no fold state to lose. Records live in the session and are replayed from it, so
-folding survives `--resume` and survives `/reload` mid-session. The on/off toggle is the only piece of
-memory, and losing it just means folding is on again.
+folding survives `--resume` and survives `/reload` mid-session. The `/dmail` toggle is not persisted;
+a new session starts from the `dmail.enabled` setting, which defaults to on.
 
 **Bounded damage.** A fold that no longer resolves is skipped, not applied partially. And a fold can
 never separate an assistant message from the tool results that answer it — that is a hard provider error,
@@ -118,8 +137,9 @@ alongside `fold.ts`, `profile.ts` and `POLICY.md`.
   discoverable.
 - `SendDMail` refuses a step that has already been folded out of view, and refuses the step the agent is
   currently in — there is nothing finished to fold yet.
-- Tests: `npm test` runs node's built-in runner over `test/profile.test.ts` (9 tests covering the profiler,
-  including the fold replay math it shares with the extension).
+- Tests: `npm test` runs node's built-in runner over `test/profile.test.ts` and `test/settings.test.ts`
+  (16 tests covering the profiler, including the fold replay math it shares with the extension, and the
+  `settings.json` default-mode reader).
 
 ## License
 
