@@ -16,6 +16,13 @@ The idea is borrowed from Moonshot AI's
 `SendDMail` tool folds finished messages out of its own context into a single self-written summary. Ours
 folds a range of steps; theirs rewinds to a checkpoint.
 
+![D-Mail folding, side by side: left is what the model is sent once fold records are replayed, right is
+the session as stored](docs/visuallization.gif)
+
+*Both panes are the same conversation. On the left, a fold collapses a finished range into one summary
+chip, so the sent context stays lean. On the right, the stored transcript keeps every step and never
+shrinks — which is why folding too much costs a re-read, not data.*
+
 ## How it works
 
 Steps are numbered. Conversations are shown to the agent with a `[step N]` marker before each assistant
