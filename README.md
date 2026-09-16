@@ -7,7 +7,7 @@ never by usefulness — so genuinely dead weight competes for space with the mat
 The model is the one thing in the loop that actually knows which steps it is done with, and pi gave
 it no way to say so.
 
-D-Mail is one tool that closes that gap. `SendDMail(fromStep, summary)` records that everything from
+D-Mail is one tool that closes that gap. `send_dmail(fromStep, summary)` records that everything from
 `fromStep` up to the last completed step is finished with, and that `summary` replaces it. A `context`
 hook replays those records on every request, so the agent is sent the summary instead of the transcript.
 
@@ -22,20 +22,20 @@ Steps are numbered. Conversations are shown to the agent with a `[step N]` marke
 turn. Numbers come from the branch, so a step keeps its number even after it has been folded away — but
 markers are only emitted for steps still in view.
 
-`SendDMail(fromStep, summary)` folds from `fromStep` through the last *completed* step. The step the
+`send_dmail(fromStep, summary)` folds from `fromStep` through the last *completed* step. The step the
 agent is currently in is never folded, so it passes the earliest step it is done with, not the current
 one. The end of the range is resolved once, at call time, and frozen: a fold cannot quietly swallow every
 step that follows it.
 
 ## Using it
 
-You rarely invoke D-Mail directly — the agent calls `SendDMail` when it decides a stretch of transcript
+You rarely invoke D-Mail directly — the agent calls `send_dmail` when it decides a stretch of transcript
 is finished. What you get is a status badge in the footer and two commands:
 
 - A blue **`D-MAIL ON`** badge when folding is active, a red **`⚠ D-MAIL OFF`** when it isn't.
 - `/dmail` — toggle folding for the session. Also accepts `/dmail on`, `/dmail off`, `/dmail status`.
 - `/send-dmail` — ask the agent to fold right now. The agent starts at the earliest step still in view and folds
-  through the last completed step. Refused when folding is off or when `SendDMail` is not an active tool.
+  through the last completed step. Refused when folding is off or when `send_dmail` is not an active tool.
 - `--dmail-disabled` — force folding off for one session, overriding settings (`/dmail` turns it back on).
 - `dmail.enabled` in `settings.json` — the default mode for new sessions (`false` starts them off).
 
@@ -137,7 +137,7 @@ alongside `fold.ts`, `profile.ts` and `POLICY.md`.
 - The agent's folding policy lives in `POLICY.md` and is appended to the system prompt. Point `DMAIL_POLICY`
   at a different file to use your own; if the file is missing, a short built-in fallback keeps the tool
   discoverable.
-- `SendDMail` refuses a step that has already been folded out of view, and refuses the step the agent is
+- `send_dmail` refuses a step that has already been folded out of view, and refuses the step the agent is
   currently in — there is nothing finished to fold yet.
 - Tests: `npm test` runs node's built-in runner over `test/profile.test.ts` and `test/settings.test.ts`
   (16 tests covering the profiler, including the fold replay math it shares with the extension, and the

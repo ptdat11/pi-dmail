@@ -7,7 +7,7 @@
  *
  * The unit of work is a *fold record*: a promise that a range of finished steps
  * has been replaced by a summary. Records are produced by the model (via the
- * `SendDMail` tool) and replayed here on every request. Replay is idempotent:
+ * `send_dmail` tool) and replayed here on every request. Replay is idempotent:
  * applying the same records to the same entries always yields the same list.
  *
  * The one invariant that must never break: a fold may not separate an assistant

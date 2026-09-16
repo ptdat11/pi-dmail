@@ -1,6 +1,6 @@
 # Folding your context (D-Mail)
 
-You have a `SendDMail` tool. It removes a run of finished steps from everything
+You have a `send_dmail` tool. It removes a run of finished steps from everything
 you will be sent from now on, and puts a summary you write in their place.
 
 ## When to fold

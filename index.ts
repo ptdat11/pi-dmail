@@ -6,7 +6,7 @@
  * threshold and cuts by recency, so the material that is genuinely dead weight
  * competes for space with the material that matters.
  *
- * D-Mail closes that gap with one tool. `SendDMail(fromStep, summary)` records
+ * D-Mail closes that gap with one tool. `send_dmail(fromStep, summary)` records
  * that everything from `fromStep` up to the last completed step is finished with,
  * and that `summary` replaces it. A `context` hook replays those records on every
  * request, so the agent is sent the summary instead of the transcript.
@@ -56,7 +56,7 @@ import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const POLICY_PATH = process.env.DMAIL_POLICY ?? join(HERE, "POLICY.md");
 
-const TOOL_NAME = "SendDMail";
+const TOOL_NAME = "send_dmail";
 const COMMAND_NAME = "dmail";
 
 /**
@@ -132,7 +132,7 @@ const SEND_DMAIL_PROMPT =
 
 /** Injecting nothing would leave the tool undiscoverable, so keep a floor. */
 const FALLBACK_POLICY = [
-	"You have a `SendDMail` tool: it folds a range of finished steps out of your context and replaces them with a summary you write.",
+	"You have a `send_dmail` tool: it folds a range of finished steps out of your context and replaces them with a summary you write.",
 	"Fold a step as soon as you have taken what you need from it and will not need to read it again. Do not wait for a phase boundary.",
 	"Steps are numbered in the conversation as `[step N]`. Pass the earliest step you are done with as `fromStep`.",
 ].join("\n");
@@ -195,7 +195,7 @@ export default function dmail(pi: ExtensionAPI): void {
 	// value is a setting (settings.json `dmail.enabled`); this only overrides it.
 	let enabled = true;
 	// True only while *we* are the ones hiding the tool, so that re-enabling does not
-	// hand SendDMail back to a user who had deliberately deactivated it.
+	// hand send_dmail back to a user who had deliberately deactivated it.
 	let toolSuppressed = false;
 
 	const paint = (ctx: ExtensionContext): void => {
@@ -207,7 +207,7 @@ export default function dmail(pi: ExtensionAPI): void {
 	};
 
 	/**
-	 * Keep `SendDMail` out of the advertised tool list while disabled. Rebuilding the
+	 * Keep `send_dmail` out of the advertised tool list while disabled. Rebuilding the
 	 * list from `getActiveTools()` rather than from a constant means we never clobber
 	 * another extension's tool configuration.
 	 */
@@ -340,12 +340,12 @@ export default function dmail(pi: ExtensionAPI): void {
 
 	pi.registerTool({
 		name: TOOL_NAME,
-		label: "SendDMail",
+		label: "Send D-Mail",
 		description:
 			"Fold a range of finished steps out of your context and replace them with a summary you write. " +
 			"Everything from `fromStep` up to the last completed step stops being sent; the step you are in is kept. " +
 			"Nothing is deleted from the session or from disk, so folding too much costs only a re-read.",
-		promptSnippet: "SendDMail — fold finished steps out of context, replacing them with a summary you write",
+		promptSnippet: "send_dmail — fold finished steps out of context, replacing them with a summary you write",
 		parameters: Type.Object({
 			fromStep: Type.Number({
 				description: "Number of the earliest step to fold, as shown by the [step N] markers.",
