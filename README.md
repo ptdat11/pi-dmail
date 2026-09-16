@@ -30,10 +30,12 @@ step that follows it.
 ## Using it
 
 You rarely invoke D-Mail directly — the agent calls `SendDMail` when it decides a stretch of transcript
-is finished. What you get is a status badge in the footer and a command:
+is finished. What you get is a status badge in the footer and two commands:
 
 - A blue **`D-MAIL ON`** badge when folding is active, a red **`⚠ D-MAIL OFF`** when it isn't.
 - `/dmail` — toggle folding for the session. Also accepts `/dmail on`, `/dmail off`, `/dmail status`.
+- `/send-dmail` — ask the agent to fold right now. The agent starts at the earliest step still in view and folds
+  through the last completed step. Refused when folding is off or when `SendDMail` is not an active tool.
 - `--dmail-disabled` — force folding off for one session, overriding settings (`/dmail` turns it back on).
 - `dmail.enabled` in `settings.json` — the default mode for new sessions (`false` starts them off).
 

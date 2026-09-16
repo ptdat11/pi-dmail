@@ -26,6 +26,9 @@
  * policy is withheld, and fold records stop being applied, so folded material comes
  * back. That is the escape hatch if a summary turns out to have dropped something.
  *
+ * `/send-dmail` is the opposite nudge: it asks the agent to fold now, starting at
+ * the earliest step still in view.
+ *
  *   Bounded damage. A fold that no longer resolves is skipped, not applied
  *   partially, and a fold can never separate an assistant message from its tool
  *   results — that is a hard provider error, and `fold.ts` refuses any range that
@@ -115,6 +118,17 @@ function badge(theme: BadgeTheme, enabled: boolean): string {
 const OFF_MESSAGE =
 	"D-Mail DISABLED for this session. Folding stops and the raw transcript goes out instead, " +
 	"so anything folded earlier is back in context. Run /dmail again to re-enable.";
+
+/**
+ * `/send-dmail` injects this as a user message. It is deliberately short: the
+ * mechanics live in POLICY.md, so this only states the thing the user is asking
+ * for. "Still shown to you" is the load-bearing phrase — it is what makes the
+ * agent start at the first un-folded step rather than a number that has already
+ * been folded away.
+ */
+const SEND_DMAIL_PROMPT =
+	"Send D-Mail now. Fold from the earliest step still shown to you; the step you are in is kept. " +
+	"Put everything later steps depend on into the summary.";
 
 /** Injecting nothing would leave the tool undiscoverable, so keep a floor. */
 const FALLBACK_POLICY = [
@@ -249,6 +263,39 @@ export default function dmail(pi: ExtensionAPI): void {
 				return;
 			}
 			ctx.ui.notify(enabled ? "D-Mail enabled. Folding resumes." : OFF_MESSAGE, enabled ? "info" : "warning");
+		},
+	});
+
+	// A nudge, not a command that folds by itself: the model still owns the summary,
+	// and the step numbering it needs is already in its context as [step N] markers.
+	pi.registerCommand("send-dmail", {
+		description:
+			"Ask the agent to fold now: it starts at the earliest step still in view and runs through the last completed step.",
+		handler: async (_args, ctx) => {
+			if (!enabled) {
+				ctx.ui.notify("D-Mail is off, so there is nothing to send. Run /dmail to turn it on.", "warning");
+				return;
+			}
+			if (!pi.getActiveTools().includes(TOOL_NAME)) {
+				ctx.ui.notify(
+					`The ${TOOL_NAME} tool is not active, so the agent cannot fold. Enable it from /tools first.`,
+					"warning",
+				);
+				return;
+			}
+			// The in-flight turn that will answer this is itself a step, so one visible
+			// step is already enough to fold. Only an empty view has nothing to work with.
+			if (stepsIn(ctx.sessionManager.buildContextEntries()).length === 0) {
+				ctx.ui.notify("Nothing to fold yet — no steps in view.", "warning");
+				return;
+			}
+
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(SEND_DMAIL_PROMPT);
+				return;
+			}
+			pi.sendUserMessage(SEND_DMAIL_PROMPT, { deliverAs: "followUp" });
+			ctx.ui.notify("D-Mail requested. The agent will fold once it finishes the current turn.", "info");
 		},
 	});
 
