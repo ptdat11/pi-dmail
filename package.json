@@ -1,0 +1,23 @@
+{
+  "name": "dmail",
+  "private": true,
+  "type": "module",
+  "description": "D-Mail — model-driven context folding for Pi.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ptdat11/pi-dmail.git"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test",
+    "profile": "node profile.ts"
+  }
+}
