@@ -19,13 +19,36 @@ const BIG = "x".repeat(4000); // ~1000 estimated tokens at chars/4
 interface BuildOptions {
 	/** Insert a dmail.fold record after step 2, replacing step 1. */
 	withFold?: boolean;
+	/** Omit usage.cost to exercise the "provider reported no cost" path. */
+	withCost?: boolean;
+}
+
+/** Fixed provider rates ($/M tokens) so a session's implied rates are checkable by hand. */
+const RATES = { input: 0.1, cacheRead: 0.001, output: 0.2 };
+
+function costFor(input: number, cacheRead: number, output: number): Record<string, number> {
+	const total = input * RATES.input + cacheRead * RATES.cacheRead + output * RATES.output;
+	return {
+		input: (input * RATES.input) / 1e6,
+		cacheRead: (cacheRead * RATES.cacheRead) / 1e6,
+		cacheWrite: 0,
+		output: (output * RATES.output) / 1e6,
+		total: total / 1e6,
+	};
 }
 
 function entry(id: string, parentId: string | null, timestamp: string, extra: Record<string, unknown>): string {
 	return JSON.stringify({ id, parentId, timestamp, ...extra });
 }
 
-function assistant(id: string, parentId: string | null, timestamp: string, input: number, cacheRead: number): string {
+function assistant(
+	id: string,
+	parentId: string | null,
+	timestamp: string,
+	input: number,
+	cacheRead: number,
+	withCost = true,
+): string {
 	return entry(id, parentId, timestamp, {
 		type: "message",
 		message: {
@@ -40,7 +63,7 @@ function assistant(id: string, parentId: string | null, timestamp: string, input
 				cacheRead,
 				cacheWrite: 0,
 				totalTokens: input + cacheRead + 10,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				...(withCost ? { cost: costFor(input, cacheRead, 10) } : {}),
 			},
 			stopReason: "stop",
 			timestamp: Date.parse(timestamp),
@@ -49,13 +72,14 @@ function assistant(id: string, parentId: string | null, timestamp: string, input
 }
 
 function buildSession(options: BuildOptions = {}): string {
+	const withCost = options.withCost ?? true;
 	const lines = [
 		JSON.stringify({ type: "session", version: 3, id: "sess-1", timestamp: "2026-01-01T00:00:00.000Z", cwd: "/tmp" }),
 		entry("u1", null, "2026-01-01T00:00:01.000Z", {
 			type: "message",
 			message: { role: "user", content: BIG, timestamp: Date.parse("2026-01-01T00:00:01.000Z") },
 		}),
-		assistant("a1", "u1", "2026-01-01T00:00:02.000Z", 100, 0),
+		assistant("a1", "u1", "2026-01-01T00:00:02.000Z", 100, 0, withCost),
 		entry("t1", "a1", "2026-01-01T00:00:03.000Z", {
 			type: "message",
 			message: {
@@ -67,7 +91,7 @@ function buildSession(options: BuildOptions = {}): string {
 				timestamp: Date.parse("2026-01-01T00:00:03.000Z"),
 			},
 		}),
-		assistant("a2", "t1", "2026-01-01T00:00:04.000Z", 100, 1000),
+		assistant("a2", "t1", "2026-01-01T00:00:04.000Z", 100, 1000, withCost),
 	];
 	if (options.withFold) {
 		lines.push(
@@ -83,7 +107,7 @@ function buildSession(options: BuildOptions = {}): string {
 			type: "message",
 			message: { role: "user", content: BIG, timestamp: Date.parse("2026-01-01T00:00:06.000Z") },
 		}),
-		assistant("a3", "u2", "2026-01-01T00:00:07.000Z", 100, 2000),
+		assistant("a3", "u2", "2026-01-01T00:00:07.000Z", 100, 2000, withCost),
 	);
 	return `${lines.join("\n")}\n`;
 }
@@ -104,6 +128,11 @@ test("session without folds: folding only costs the step markers", async () => {
 
 	// No fold anywhere, so nothing should ever claim a saving.
 	for (const request of profile.requests) assert.ok(request.saved <= 0);
+
+	// The dollar range stays ordered even when the saving itself is negative.
+	const second = profile.requests[1];
+	assert.ok((second.savedCostLow ?? 0) <= (second.savedCostHigh ?? 0));
+	assert.ok((second.savedCostHigh ?? 0) < 0);
 });
 
 test("an applied fold shows up as a real saving at the next request", async () => {
@@ -150,6 +179,40 @@ test("json report is serializable and carries the totals", async () => {
 	assert.equal(roundTripped.totals.requests, 3);
 	assert.ok(roundTripped.totals.saved > 0);
 	assert.equal(roundTripped.totals.foldsApplied, 1);
+});
+
+test("usage.cost becomes marginal rates and a saved-dollar range", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true }));
+	const cost = profile.cost;
+	assert.ok(cost, "the session reports cost");
+	assert.equal(cost.reported, 3);
+
+	// Rates are recovered from the session's own usage/cost pairs: 100 input and
+	// 1000/2000 cacheRead tokens per request, at the fixed test rates.
+	assert.ok(Math.abs((cost.rates.input ?? 0) - RATES.input) < 1e-9);
+	assert.ok(Math.abs((cost.rates.cacheRead ?? 0) - RATES.cacheRead) < 1e-9);
+	assert.ok(Math.abs((cost.rates.output ?? 0) - RATES.output) < 1e-9);
+	// Blended prompt rate = prompt-side cost / prompt tokens (3300 here).
+	assert.ok(Math.abs((cost.rates.blendedPrompt ?? 0) - (cost.promptSide / 3300) * 1e6) < 1e-9);
+
+	// The saved-token range brackets the cached-prefix rate and the blended rate.
+	assert.equal(cost.savedRates.low, cost.rates.cacheRead);
+	assert.equal(cost.savedRates.high, cost.rates.blendedPrompt);
+	assert.ok(Math.abs(cost.savedLow - (profile.totals.saved * cost.savedRates.low) / 1e6) < 1e-12);
+	assert.ok(Math.abs(cost.savedHigh - (profile.totals.saved * cost.savedRates.high) / 1e6) < 1e-12);
+	assert.ok(cost.savedLow < cost.savedHigh, "the range must not collapse");
+
+	// The third request is the one the fold actually helps, in dollars too.
+	assert.ok((profile.requests[2].savedCostLow ?? 0) > 0);
+	assert.ok((profile.requests[2].savedCostHigh ?? 0) > (profile.requests[2].savedCostLow ?? 0));
+});
+
+test("a session without usage.cost reports no cost block", async () => {
+	const profile = await analyzeSession(buildSession({ withCost: false }));
+	assert.equal(profile.cost, null);
+	assert.equal(profile.requests[0].cost, null);
+	assert.equal(profile.requests[0].savedCostLow, null);
+	assert.equal(profile.requests[0].savedCostHigh, null);
 });
 
 // ---------------------------------------------------------------------------

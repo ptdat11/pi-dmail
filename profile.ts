@@ -22,6 +22,14 @@
  * delta as the trustworthy number, and `overhead` as a drift check: it should
  * not wander much across requests.
  *
+ * Cost comes from the persisted `usage.cost`, and folded-away tokens are valued
+ * with marginal rates derived from the same session's own usage/cost pairs, so
+ * no price table is needed. The saving is a range, not a point, because the raw
+ * counterfactual's cache behaviour cannot be observed: the low end charges the
+ * extra tokens as a cached prefix, the high end at the session's blended prompt
+ * rate. Output spend is unaffected by folding, so prompt-side spend is the
+ * ceiling on any saving.
+ *
  * Usage:
  *   node profile.ts <session.jsonl|session-id-prefix> [--last N] [--json] [--csv]
  *   node profile.ts --list [query] [--all] [--deep] [--json]
@@ -605,6 +613,12 @@ export interface RequestProfile {
 	/** estRaw − estFolded. */
 	saved: number;
 	savedPct: number | null;
+	/** Provider-reported cost for this request, or null when it reported none. */
+	cost: number | null;
+	/** Dollar value of `saved` at the cached-prefix marginal rate. */
+	savedCostLow: number | null;
+	/** Dollar value of `saved` at the blended prompt marginal rate. */
+	savedCostHigh: number | null;
 	/** actualPrompt − estFolded: unmodeled overhead plus estimator error. */
 	overhead: number | null;
 	/** Folds in effect for this request. */
@@ -623,6 +637,27 @@ export interface FoldProfile {
 	summaryChars: number;
 	/** Index of the first request this fold was in effect for, if ever. */
 	effectiveAtRequest: number | null;
+}
+
+export interface CostBuckets {
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	output: number;
+	total: number;
+}
+
+export interface CostTotals extends CostBuckets {
+	/** Requests whose cost the provider reported. */
+	reported: number;
+	/** input + cacheRead + cacheWrite: the ceiling on what folding could ever save. */
+	promptSide: number;
+	/** Implied dollars per million tokens, from this session's own usage/cost pairs. */
+	rates: { input: number | null; cacheRead: number | null; output: number | null; blendedPrompt: number | null };
+	/** Rates used to value folded-away tokens: cached prefix (low), blended prompt (high). */
+	savedRates: { low: number; high: number };
+	savedLow: number;
+	savedHigh: number;
 }
 
 export interface ProfileTotals {
@@ -649,6 +684,8 @@ export interface Profile {
 	requests: RequestProfile[];
 	folds: FoldProfile[];
 	totals: ProfileTotals;
+	/** null when no request in the session reported `usage.cost`. */
+	cost: CostTotals | null;
 }
 
 function mean(values: number[]): number | null {
@@ -659,6 +696,62 @@ function mean(values: number[]): number | null {
 function pct(numerator: number, denominator: number): number | null {
 	if (denominator <= 0) return null;
 	return (numerator / denominator) * 100;
+}
+
+/** Provider-reported cost for one request, or null when the session records none. */
+function readCost(usage: AnyMessage | undefined): CostBuckets | null {
+	const raw = usage?.cost as AnyMessage | undefined;
+	if (!raw || typeof raw !== "object") return null;
+	const keys = ["input", "cacheRead", "cacheWrite", "output", "total"] as const;
+	if (!keys.some((key) => typeof raw[key] === "number")) return null;
+	const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+	const input = num(raw.input);
+	const cacheRead = num(raw.cacheRead);
+	const cacheWrite = num(raw.cacheWrite);
+	const output = num(raw.output);
+	return { input, cacheRead, cacheWrite, output, total: num(raw.total) || input + cacheRead + cacheWrite + output };
+}
+
+/**
+ * Turn reported cost into marginal rates and a dollar value for the saved
+ * tokens. Rates come from the session's own usage/cost pairs, so no price table
+ * is needed. The result is a range: the raw counterfactual's cache behaviour is
+ * unobservable, so the extra tokens are bracketed between the cached-prefix
+ * rate and the blended prompt rate.
+ */
+function buildCostTotals(buckets: CostBuckets & { reported: number }, totals: ProfileTotals): CostTotals | null {
+	const promptCost = buckets.input + buckets.cacheRead + buckets.cacheWrite;
+	const promptTokens = totals.input + totals.cacheRead + totals.cacheWrite;
+	if (buckets.reported === 0 || promptTokens <= 0) return null;
+
+	const perMillion = (cost: number, tokens: number): number | null => (tokens > 0 ? (cost / tokens) * 1_000_000 : null);
+	const rates = {
+		input: perMillion(buckets.input, totals.input),
+		cacheRead: perMillion(buckets.cacheRead, totals.cacheRead),
+		output: perMillion(buckets.output, totals.output),
+		blendedPrompt: perMillion(promptCost, promptTokens),
+	};
+	// A folded-away token is most plausibly part of a stable cached prefix, but it
+	// could have been charged at the session's blended prompt rate. Bracket both.
+	const low = rates.cacheRead ?? rates.blendedPrompt ?? 0;
+	const high = Math.max(low, rates.blendedPrompt ?? low);
+	// saved can be negative (markers cost a little before any fold lands), so sort
+	// the two products to keep the reported range ordered whichever way it leans.
+	const savedLow = (totals.saved * low) / 1_000_000;
+	const savedHigh = (totals.saved * high) / 1_000_000;
+	return {
+		reported: buckets.reported,
+		input: buckets.input,
+		cacheRead: buckets.cacheRead,
+		cacheWrite: buckets.cacheWrite,
+		output: buckets.output,
+		total: buckets.total,
+		promptSide: promptCost,
+		rates,
+		savedRates: { low, high },
+		savedLow: Math.min(savedLow, savedHigh),
+		savedHigh: Math.max(savedLow, savedHigh),
+	};
 }
 
 /**
@@ -695,6 +788,14 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 	const effectiveAtRequest = new Map<string, number>();
 
 	const requests: RequestProfile[] = [];
+	const costBuckets: CostBuckets & { reported: number } = {
+		input: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		output: 0,
+		total: 0,
+		reported: 0,
+	};
 	let previousFoldsActive = 0;
 
 	for (const entry of branch) {
@@ -724,6 +825,15 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		const cacheRead = hasUsage ? usage.cacheRead ?? 0 : 0;
 		const cacheWrite = hasUsage ? usage.cacheWrite ?? 0 : 0;
 		const output = hasUsage ? usage.output ?? 0 : 0;
+		const cost = readCost(usage);
+		if (cost) {
+			costBuckets.input += cost.input;
+			costBuckets.cacheRead += cost.cacheRead;
+			costBuckets.cacheWrite += cost.cacheWrite;
+			costBuckets.output += cost.output;
+			costBuckets.total += cost.total;
+			costBuckets.reported++;
+		}
 		// totalTokens includes output; the prompt is everything but the reply.
 		const actualPrompt = hasUsage
 			? calculateContextTokens(usage) - output
@@ -746,6 +856,9 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 			estRaw,
 			saved: estRaw - estFolded,
 			savedPct: pct(estRaw - estFolded, estRaw),
+			cost: cost?.total ?? null,
+			savedCostLow: null,
+			savedCostHigh: null,
 			overhead: hasUsage ? actualPrompt - estFolded : null,
 			foldsActive,
 			foldStarted: foldsActive > previousFoldsActive,
@@ -792,7 +905,17 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		meanOverhead: mean(overheads),
 	};
 
-	return { sessionFile, piHelpers: pi !== undefined, requests, folds, totals };
+	const cost = buildCostTotals(costBuckets, totals);
+	if (cost) {
+		for (const request of requests) {
+			const low = (request.saved * cost.savedRates.low) / 1_000_000;
+			const high = (request.saved * cost.savedRates.high) / 1_000_000;
+			request.savedCostLow = Math.min(low, high);
+			request.savedCostHigh = Math.max(low, high);
+		}
+	}
+
+	return { sessionFile, piHelpers: pi !== undefined, requests, folds, totals, cost };
 }
 
 // ============================================================================
@@ -805,6 +928,28 @@ function fmt(n: number): string {
 
 function fmtPct(value: number | null, digits = 1): string {
 	return value === null ? "-" : `${value.toFixed(digits)}%`;
+}
+
+/** Dollars with just enough precision to stay readable at fractional-cent sizes. */
+function fmtDollars(value: number | null): string {
+	if (value === null) return "-";
+	const magnitude = Math.abs(value);
+	const digits = magnitude >= 1 ? 2 : magnitude >= 0.01 ? 3 : 4;
+	// Round at the displayed precision first so tiny negatives render as $0, not $-0.0000.
+	const rounded = Number(value.toFixed(digits));
+	if (rounded === 0) return "$0";
+	return `$${rounded.toFixed(digits)}`;
+}
+
+/** A dollar range, collapsed to a single value when the ends round together. */
+function fmtDollarsRange(low: number | null, high: number | null): string {
+	if (low === null || high === null) return "-";
+	if (Math.abs(high - low) < 0.00005) return fmtDollars(low);
+	return `${fmtDollars(low)}–${fmtDollars(high)}`;
+}
+
+function fmtRate(value: number | null): string {
+	return value === null ? "-" : `$${value.toFixed(4)}`;
 }
 
 function renderTable(profile: Profile): string {
@@ -820,6 +965,7 @@ function renderTable(profile: Profile): string {
 		"estFold",
 		"estRaw",
 		"saved",
+		"$saved",
 		"folds",
 	];
 	const rows = profile.requests.map((request) => [
@@ -834,6 +980,7 @@ function renderTable(profile: Profile): string {
 		fmt(request.estFolded),
 		fmt(request.estRaw),
 		request.saved > 0 ? `+${fmt(request.saved)}` : fmt(request.saved),
+		fmtDollarsRange(request.savedCostLow, request.savedCostHigh),
 		request.foldsActive === 0 ? "0" : `${request.foldsActive}${request.foldStarted ? "+" : ""}`,
 	]);
 
@@ -864,6 +1011,25 @@ function renderSummary(profile: Profile): string {
 		lines.push(
 			`  mean overhead     ${fmt(t.meanOverhead)} tokens/request (system prompt + tools + framing + chars/4 estimator gap)`,
 		);
+	}
+	lines.push("");
+	lines.push("Cost");
+	if (profile.cost) {
+		const c = profile.cost;
+		lines.push(
+			`  provider cost     ${fmtDollars(c.total)}  (input ${fmtDollars(c.input)}, cacheRead ${fmtDollars(c.cacheRead)}, cacheWrite ${fmtDollars(c.cacheWrite)}, output ${fmtDollars(c.output)}; ${c.reported}/${t.requests} requests reported)`,
+		);
+		lines.push(
+			`  implied rates     ${fmtRate(c.rates.input)} input, ${fmtRate(c.rates.cacheRead)} cacheRead, ${fmtRate(c.rates.output)} output  ($/M tokens)`,
+		);
+		lines.push(
+			`  estimated saving  ${fmtDollars(c.savedLow)}-${fmtDollars(c.savedHigh)}  (${fmtPct(pct(c.savedLow, c.total))}-${fmtPct(pct(c.savedHigh, c.total))} of provider cost)`,
+		);
+		lines.push(`  prompt-side cap   ${fmtDollars(c.promptSide)}  (output spend is unaffected by folding)`);
+		lines.push("  low values saved tokens at the cached-prefix rate, high at the blended prompt rate;");
+		lines.push("  both are estimates: saved is chars/4 and the raw cache path is unknowable.");
+	} else {
+		lines.push("  no usage.cost reported in this session, so $saved is unavailable.");
 	}
 	if (profile.folds.length > 0) {
 		lines.push("");
@@ -905,6 +1071,9 @@ function renderCsv(profile: Profile): string {
 		"foldsActive",
 		"foldStarted",
 		"skippedFolds",
+		"cost",
+		"savedCostLow",
+		"savedCostHigh",
 	];
 	const escape = (value: unknown): string => {
 		const text = value === null || value === undefined ? "" : String(value);
@@ -930,6 +1099,9 @@ function renderCsv(profile: Profile): string {
 			request.foldsActive,
 			request.foldStarted,
 			request.skippedFolds,
+			request.cost,
+			request.savedCostLow,
+			request.savedCostHigh,
 		]
 			.map(escape)
 			.join(","),
@@ -1000,6 +1172,8 @@ function usage(): string {
 		"",
 		"Profiles one Pi session: provider-reported prompt size and cache split",
 		"next to the reconstructed D-Mailed and raw context sizes.",
+		"Provider cost and the estimated folding saving ($saved) are included",
+		"whenever the session records usage.cost.",
 		"",
 		"  <session>   any of: a path to a .jsonl file, a path relative to the",
 		"              sessions root, or an unambiguous session id prefix",

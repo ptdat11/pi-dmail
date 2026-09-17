@@ -114,6 +114,13 @@ extension itself uses, so the difference between them is the genuine effect of f
 estimate is a characters/4 heuristic and does not model the system prompt or tool schemas, so trust the
 folded-vs-raw delta and treat `overhead` as a drift check. It should not wander much across requests.
 
+Provider cost comes from the persisted `usage.cost`, and the `$saved` column values the folded-away
+(`saved`) tokens at marginal rates derived from the same session's own usage/cost pairs — no price table
+is needed. The saving is a range, not a point, because the raw counterfactual's cache behaviour cannot be
+observed: the low end charges the extra tokens as a cached prefix, the high end at the session's blended
+prompt rate. Output spend is unaffected by folding, so the summary also prints prompt-side spend as the
+ceiling on any saving. Sessions that never record `usage.cost` show no cost block.
+
 The profiler runs standalone, with local ports of the helpers it needs; when
 `@earendil-works/pi-coding-agent` is resolvable it uses pi's real helpers instead, which keeps the numbers
 identical to pi's own context gauge.
@@ -147,8 +154,8 @@ alongside `fold.ts`, `profile.ts` and `POLICY.md`.
 - `send_dmail` refuses a step that has already been folded out of view, and refuses the step the agent is
   currently in — there is nothing finished to fold yet.
 - Tests: `npm test` runs node's built-in runner over `test/profile.test.ts` and `test/settings.test.ts`
-  (16 tests covering the profiler, including the fold replay math it shares with the extension, and the
-  `settings.json` default-mode reader).
+  (18 tests covering the profiler, including the fold replay math it shares with the extension, the
+  cost/`$saved` derivation, and the `settings.json` default-mode reader).
 
 ## License
 
