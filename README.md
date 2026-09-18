@@ -46,6 +46,11 @@ is finished. What you get is a status badge in the footer and two commands:
 - `--dmail-disabled` — force folding off for one session, overriding settings (`/dmail` turns it back on).
 - `dmail.enabled` in `settings.json` — the default mode for new sessions (`false` starts them off).
 
+Each fold is reported in the transcript as a single line — `✓ Folded steps 3–8 — <first line of the summary>`
+followed by a `(ctrl+o to expand)` hint. Press **ctrl+o** to expand it and read the full summary that replaced
+those steps; press it again to collapse. Expanding is read-only — it changes what you see in the TUI, never what
+the agent is sent.
+
 Turning it off is a real escape hatch, not a cosmetic switch: the tool is withdrawn, the agent's folding
 instructions are withheld, and fold records stop being applied — so anything folded earlier comes back
 into context as the raw transcript. That is what to reach for if a summary turns out to have dropped

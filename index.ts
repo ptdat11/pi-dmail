@@ -46,11 +46,14 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
+	keyHint,
 	type SessionEntry,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { FOLD_TYPE, foldContext, numberSteps, type FoldRecord, type NumberedStep } from "./fold.ts";
+import { type FoldRenderDetails, foldResultText } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -420,6 +423,21 @@ export default function dmail(pi: ExtensionAPI): void {
 					toEntryId: current.entryId,
 				},
 			};
+		},
+		/**
+		 * Pi draws this instead of the raw `content` line, which named the folded
+		 * range but never showed the summary. Collapsed it previews the summary and
+		 * advertises the expand key; expanded it shows the summary whole.
+		 */
+		renderResult(result, { expanded }, theme, context) {
+			const summary = typeof context.args.summary === "string" ? context.args.summary : "";
+			const text = foldResultText(
+				(result.details ?? {}) as FoldRenderDetails,
+				summary,
+				keyHint("app.tools.expand", "to expand"),
+				expanded,
+			);
+			return new Text(`${theme.fg("success", "✓")} ${text}`, 0, 0);
 		},
 	});
 }
