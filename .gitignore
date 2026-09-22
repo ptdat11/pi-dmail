@@ -1,2 +1,4 @@
 node_modules/
 *.jsonl
+__pycache__/
+*.tgz
