@@ -75,8 +75,10 @@ import {
 	foldHeadroomLine,
 	foldResultText,
 	foldSkippedLine,
+	foldSummaryPreview,
 } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
+import { buildFoldPickerRows, estimateLine, type FoldPickerRow } from "./picker.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const POLICY_PATH = process.env.DMAIL_POLICY ?? join(HERE, "POLICY.md");
@@ -155,6 +157,21 @@ const SEND_DMAIL_PROMPT =
 	"Send D-Mail now. Fold from the earliest step still shown to you; the step you are in is kept. " +
 	"Put everything later steps depend on into the summary.";
 
+/**
+ * `/dmail fold` pins a START; this is the prompt that delivers it — the same
+ * prompt path as SEND_DMAIL_PROMPT (idle → plain send, busy → followUp), but the
+ * cut point is fixed by the user. The agent owns the prose: it writes the
+ * summary and performs the fold itself from exactly the pinned step.
+ */
+function foldPinPrompt(fromStep: number, throughStep: number): string {
+	return (
+		`The user pinned the cut point: fold from step ${fromStep} through step ${throughStep}. ` +
+		`Fold from exactly step ${fromStep} — the user owns the cut point, and the end is the latest finished step. ` +
+		`Write the summary yourself with send_dmail(fromStep=${fromStep}, summary): put everything later steps depend on into it. ` +
+		`When the fold lands, tell the user the context was folded on their behalf.`
+	);
+}
+
 /** Injecting nothing would leave the tool undiscoverable, so keep a floor. */
 const FALLBACK_POLICY = [
 	"You have a `send_dmail` tool: it folds a range of finished steps out of your context and replaces them with a summary you write.",
@@ -186,6 +203,22 @@ function stepsIn(entries: readonly SessionEntry[]): NumberedStep[] {
 
 function userMessage(text: string, timestamp: number): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp };
+}
+
+/** All text parts of an entry (the picker preview keeps the first line); blank for non-text entries. */
+function entryText(entry: SessionEntry | undefined): string {
+	if (!entry || entry.type !== "message") return "";
+	// AgentMessage is a union; only the message-shaped members carry content.
+	const content = (entry.message as { content?: unknown }).content;
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	return content
+		.map((part) =>
+			part && typeof part === "object" && "text" in part
+				? String((part as { text?: unknown }).text ?? "")
+				: "",
+		)
+		.join("\n");
 }
 
 /**
@@ -443,6 +476,9 @@ export default function dmail(pi: ExtensionAPI): void {
 	// the session that asked for it — the same choice bash-guard made. The *starting*
 	// value is a setting (settings.json `dmail.enabled`); this only overrides it.
 	let enabled = true;
+	// The start last pinned through `/dmail fold`: consumed by the next real fold
+	// so its confirmation can tell the user the fold happened on their behalf.
+	let pinnedFromStep: number | undefined;
 	// True only while *we* are the ones hiding the tool, so that re-enabling does not
 	// hand send_dmail back to a user who had deliberately deactivated it.
 	let toolSuppressed = false;
@@ -493,15 +529,129 @@ export default function dmail(pi: ExtensionAPI): void {
 		paint(ctx);
 	});
 
+	/**
+	 * `/dmail fold` — the user owns the cut point, the agent owns the prose.
+	 * Rows come from the replayed view (visible steps + one row per folded
+	 * region); picking a row pins only the START and hands it to the agent via
+	 * the same prompt path as /send-dmail. Cancel changes nothing; without an
+	 * interactive UI the printed list plus `/dmail fold <step>` keeps headless
+	 * sessions working.
+	 */
+	async function foldCommand(ctx: ExtensionContext, rest: string): Promise<void> {
+		// Same guards as /send-dmail: an unreachable fold helps no one.
+		if (!enabled) {
+			ctx.ui.notify("D-Mail is off, so there is nothing to fold. Run /dmail to turn it on.", "warning");
+			return;
+		}
+		if (!pi.getActiveTools().includes(TOOL_NAME)) {
+			ctx.ui.notify(`The ${TOOL_NAME} tool is not active, so the agent cannot fold. Enable it from /tools first.`, "warning");
+			return;
+		}
+		const entries = ctx.sessionManager.buildContextEntries();
+		const branch = ctx.sessionManager.getBranch();
+		const visible = visibleStepsOf(entries, branch);
+		if (visible.length === 0) {
+			ctx.ui.notify("Nothing to fold yet — no steps in view.", "warning");
+			return;
+		}
+		const current = visible[visible.length - 1];
+		const plan = planForView(entries, branch);
+		const entryById = new Map(entries.map((entry) => [entry.id, entry]));
+		const estimates = new Map<number, string | undefined>();
+		const rows = buildFoldPickerRows({
+			steps: visible,
+			current,
+			folds: plan.inEra,
+			previewOf: (step) => foldSummaryPreview(entryText(entryById.get(step.entryId))),
+			estimateOf: (fromStep) => {
+				// One estimateWalk per row, memoised across redraws of the same rows.
+				if (estimates.has(fromStep)) return estimates.get(fromStep);
+				const target = visible.find((step) => step.step === fromStep);
+				let line: string | undefined;
+				if (target && target.step !== current.step) {
+					const planForStart = estimateFold(entries, target, current, PRICE_SUMMARY_SAMPLE, plan.skipped.length, ctx);
+					line = estimateLine(planForStart.economics.removedTokens);
+				}
+				estimates.set(fromStep, line);
+				return line;
+			},
+		});
+		if (rows.length === 0) {
+			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
+			return;
+		}
+
+		// Deliver the pinned start exactly like /send-dmail delivers its nudge.
+		const pin = (row: FoldPickerRow): void => {
+			pinnedFromStep = row.fromStep;
+			const prompt = foldPinPrompt(row.fromStep, current.step - 1);
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt);
+				ctx.ui.notify(`Pinned step ${row.fromStep} — the agent will fold from there and write the summary.`, "info");
+			} else {
+				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+				ctx.ui.notify(`Pinned step ${row.fromStep}. The agent will fold once it finishes the current turn.`, "info");
+			}
+		};
+
+		// Explicit start: `/dmail fold 2` — the headless way to pin a row.
+		const arg = rest.trim();
+		if (arg !== "") {
+			if (!/^\d+$/.test(arg)) {
+				ctx.ui.notify(`"${arg}" is not a step number. Try /dmail fold 2.`, "error");
+				return;
+			}
+			const row = rows.find((candidate) => candidate.fromStep === Number(arg));
+			if (!row) {
+				ctx.ui.notify(
+					`There is no step ${arg} to fold from. Starts: [${rows.map((candidate) => candidate.fromStep).join(", ")}].`,
+					"error",
+				);
+				return;
+			}
+			pin(row);
+			return;
+		}
+
+		// No dialog-capable UI (print/json mode, missing select): print the list.
+		const interactive = ctx.hasUI !== false && typeof ctx.ui.select === "function";
+		if (!interactive) {
+			ctx.ui.notify(
+				[
+					"No interactive picker here — pin a start with /dmail fold <step>:",
+					...rows.map((row) => `· ${row.label}`),
+				].join("\n"),
+				"info",
+			);
+			return;
+		}
+
+		const chosen = await ctx.ui.select(
+			"Fold from which step? The step you are in is kept.",
+			rows.map((row) => row.label),
+		);
+		const row = chosen === undefined ? undefined : rows.find((candidate) => candidate.label === chosen);
+		if (!row) {
+			ctx.ui.notify("Cancelled — nothing was folded.", "info");
+			return;
+		}
+		pin(row);
+	}
+
 	pi.registerCommand(COMMAND_NAME, {
 		description:
-			"Turn D-Mail on or off for this session, or price a fold. No argument toggles; also accepts on, off, status, price.",
+			"Turn D-Mail on or off for this session, price a fold, or pick where to fold. No argument toggles; also accepts on, off, status, price, fold.",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			const splitAt = trimmed.search(/\s/);
 			const arg = (splitAt === -1 ? trimmed : trimmed.slice(0, splitAt)).toLowerCase();
 			const rest = splitAt === -1 ? "" : trimmed.slice(splitAt).trim();
 
+			// The user picks the cut point; the agent authors the summary and folds.
+			if (arg === "fold") {
+				await foldCommand(ctx, rest);
+				return;
+			}
 			// Price is read-only: it never toggles, never folds, never pings the agent.
 			if (arg === "price") {
 				priceCommand(ctx, rest);
@@ -512,7 +662,7 @@ export default function dmail(pi: ExtensionAPI): void {
 			else if (arg === "") enabled = !enabled;
 			else if (arg !== "status") {
 				ctx.ui.notify(
-					`Unknown argument "${arg}". Use /dmail, /dmail on, /dmail off, /dmail status, or /dmail price.`,
+					`Unknown argument "${arg}". Use /dmail, /dmail on, /dmail off, /dmail status, /dmail price, or /dmail fold.`,
 					"warning",
 				);
 				return;
@@ -689,10 +839,16 @@ export default function dmail(pi: ExtensionAPI): void {
 				actual: economics.actual,
 			});
 
+			// A fold from the start the user pinned through `/dmail fold` says so in
+			// the confirmation; any real fold consumes the pin, so it can only ever
+			// describe one fold (ticket 07: "folded on their behalf").
+			const behalf =
+				pinnedFromStep === target.step ? " Folded on your behalf from the step you pinned." : "";
+			pinnedFromStep = undefined;
 			// Best effort: a fold that succeeded must not be reported as a failure just
 			// because the front end could not draw a notification.
 			try {
-				ctx.ui.notify(`Folded steps ${target.step}–${through}. In effect from the next request.`, "info");
+				ctx.ui.notify(`Folded steps ${target.step}–${through}. In effect from the next request.${behalf}`, "info");
 			} catch {
 				// Ignore.
 			}

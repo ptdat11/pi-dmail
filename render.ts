@@ -91,7 +91,7 @@ export function foldSkippedLine(skipped?: number): string {
  * Compact token count for the advisory lines: `700`, `4.8k`, `48k`.
  * Estimates, so the caller always renders its own `~`.
  */
-function fmtTokens(tokens: number): string {
+export function fmtTokens(tokens: number): string {
 	if (!Number.isFinite(tokens)) {
 		return "?";
 	}

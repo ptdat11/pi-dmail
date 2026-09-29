@@ -8,6 +8,7 @@
     "index.ts",
     "fold.ts",
     "render.ts",
+    "picker.ts",
     "settings.ts",
     "profile.ts",
     "POLICY.md",
