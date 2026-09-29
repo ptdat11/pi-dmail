@@ -31,6 +31,17 @@ export interface FoldRecord {
 	fromStep?: number;
 }
 
+/** A fold record paired with the id of the session entry that holds it. */
+export interface LocatedFold extends FoldRecord {
+	/**
+	 * The id of the entry this record was written into. An orphan — a record
+	 * whose holder predates the boundary of the last compaction — is detected
+	 * here, not at the endpoints: an orphan can point at entries still in view,
+	 * and must still never be replayed.
+	 */
+	holderEntryId: string;
+}
+
 export interface EntryLike {
 	id: string;
 }
@@ -52,7 +63,8 @@ export interface SkippedFold {
 		| "end-not-in-context"
 		| "end-not-after-start"
 		| "start-not-a-step-boundary"
-		| "end-not-a-step-boundary";
+		| "end-not-a-step-boundary"
+		| "record-out-of-era";
 }
 
 export interface FoldResult<M> {
@@ -123,6 +135,91 @@ export function numberSteps<E extends EntryLike>(
 	return steps;
 }
 
+/** First index of each entry id; duplicate ids resolve to the earliest. */
+function indexPositions<E extends EntryLike>(entries: readonly E[]): Map<string, number> {
+	const positionOf = new Map<string, number>();
+	entries.forEach((entry, index) => {
+		if (!positionOf.has(entry.id)) positionOf.set(entry.id, index);
+	});
+	return positionOf;
+}
+
+/**
+ * Validate one record against a positional view of the entries.
+ *
+ * Shared by `foldContext` (replay) and `planReplay` (era split), so a record
+ * rejected in one place is rejected in the other for exactly the same reason.
+ * Returns the start and end indices on success, or the reason it did not take
+ * effect.
+ */
+function validateFold<E extends EntryLike>(
+	fold: FoldRecord,
+	positionOf: ReadonlyMap<string, number>,
+	entries: readonly E[],
+	isStepStart?: (entry: E) => boolean,
+): { from: number; to: number; why: null } | { from: null; to: null; why: SkippedFold["why"] } {
+	if (typeof fold?.summary !== "string" || fold.summary.trim() === "") {
+		return { from: null, to: null, why: "blank-summary" };
+	}
+	const from = positionOf.get(fold.fromEntryId);
+	if (from === undefined) return { from: null, to: null, why: "start-not-in-context" };
+	const to = positionOf.get(fold.toEntryId);
+	if (to === undefined) return { from: null, to: null, why: "end-not-in-context" };
+	if (to <= from) return { from: null, to: null, why: "end-not-after-start" };
+	if (isStepStart && !isStepStart(entries[from] as E)) {
+		return { from: null, to: null, why: "start-not-a-step-boundary" };
+	}
+	if (isStepStart && !isStepStart(entries[to] as E)) {
+		return { from: null, to: null, why: "end-not-a-step-boundary" };
+	}
+	return { from, to, why: null };
+}
+
+/** The split `foldContext` will make, computed without touching any record. */
+export interface ReplayPlan {
+	/** In-era records that passed validation, in input order. */
+	inEra: FoldRecord[];
+	/** Records that must not replay, with a reason — orphans included. */
+	skipped: SkippedFold[];
+}
+
+/**
+ * Split located fold records into what the current era may replay and what it
+ * must count as skipped.
+ *
+ * The era check runs on the record's *holder*: a record written before the
+ * boundary of the last compaction is an orphan even when both of its endpoints
+ * happen to survive in the view, and must never fold the current era. Records
+ * held in the era then go through the same validation `foldContext` applies, so
+ * the count this reports is exactly the count replay would skip.
+ *
+ * Pure and deterministic: same inputs, same plan; records are never mutated.
+ */
+export function planReplay<E extends EntryLike>(
+	entries: readonly E[],
+	folds: readonly LocatedFold[],
+	options: { isStepStart?: (entry: E) => boolean } = {},
+): ReplayPlan {
+	const positionOf = indexPositions(entries);
+	const inEra: FoldRecord[] = [];
+	const skipped: SkippedFold[] = [];
+
+	for (const fold of folds) {
+		if (!positionOf.has(fold.holderEntryId)) {
+			skipped.push({ fold, why: "record-out-of-era" });
+			continue;
+		}
+		const check = validateFold(fold, positionOf, entries, options.isStepStart);
+		if (check.why !== null) {
+			skipped.push({ fold, why: check.why });
+			continue;
+		}
+		inEra.push(fold);
+	}
+
+	return { inEra, skipped };
+}
+
 /**
  * Replay fold records over a list of entries.
  *
@@ -139,44 +236,19 @@ export function foldContext<E extends EntryLike, M>(
 	folds: readonly FoldRecord[],
 	options: FoldOptions<E, M>,
 ): FoldResult<M> {
-	const positionOf = new Map<string, number>();
-	entries.forEach((entry, index) => {
-		if (!positionOf.has(entry.id)) positionOf.set(entry.id, index);
-	});
-
+	const positionOf = indexPositions(entries);
 	const summaryAt = new Map<number, { text: string; fold: FoldRecord }>();
 	const dropped = new Set<number>();
 	const applied: FoldRecord[] = [];
 	const skipped: SkippedFold[] = [];
 
 	for (const fold of folds) {
-		if (typeof fold?.summary !== "string" || fold.summary.trim() === "") {
-			skipped.push({ fold, why: "blank-summary" });
+		const check = validateFold(fold, positionOf, entries, options.isStepStart);
+		if (check.why !== null) {
+			skipped.push({ fold, why: check.why });
 			continue;
 		}
-		const from = positionOf.get(fold.fromEntryId);
-		if (from === undefined) {
-			skipped.push({ fold, why: "start-not-in-context" });
-			continue;
-		}
-		const to = positionOf.get(fold.toEntryId);
-		if (to === undefined) {
-			skipped.push({ fold, why: "end-not-in-context" });
-			continue;
-		}
-		if (to <= from) {
-			skipped.push({ fold, why: "end-not-after-start" });
-			continue;
-		}
-		const startsStep = options.isStepStart;
-		if (startsStep && !startsStep(entries[from] as E)) {
-			skipped.push({ fold, why: "start-not-a-step-boundary" });
-			continue;
-		}
-		if (startsStep && !startsStep(entries[to] as E)) {
-			skipped.push({ fold, why: "end-not-a-step-boundary" });
-			continue;
-		}
+		const { from, to } = check;
 		// Suppression by containment: this record's range swallows every summary
 		// whose start it contains (its own included, so same-start is newest-wins).
 		// Delete before set, or `from` would delete the entry just written.

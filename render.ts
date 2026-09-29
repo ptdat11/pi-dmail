@@ -15,6 +15,9 @@
 export type FoldRenderDetails = {
 	fromStep?: number;
 	throughStep?: number;
+	/** How many fold records replay skipped, e.g. records from before the
+	 * compaction boundary. Counted, never dropped silently. */
+	skipped?: number;
 };
 
 /** Preview budget for the collapsed line, before the expand hint. */
@@ -56,6 +59,18 @@ export function foldSummaryPreview(summary: string, limit: number = PREVIEW_LIMI
 }
 
 /**
+ * The count of skipped fold records as its own line, or `""` when there is
+ * nothing to report. Skips are ordinary (a compaction boundary orphanates old
+ * records) but silent loss is not, so a non-zero count always surfaces.
+ */
+export function foldSkippedLine(skipped?: number): string {
+	if (typeof skipped !== "number" || !Number.isFinite(skipped) || skipped <= 0) {
+		return "";
+	}
+	return `folds skipped: ${skipped}`;
+}
+
+/**
  * Collapsed line: the range, a preview of the summary, and the key that reveals
  * the rest. The hint is supplied by the caller so this module stays unaware of
  * keybindings.
@@ -63,10 +78,13 @@ export function foldSummaryPreview(summary: string, limit: number = PREVIEW_LIMI
 export function foldCollapsedText(details: FoldRenderDetails, summary: string, expandHint: string): string {
 	const headline = foldHeadline(details);
 	const preview = foldSummaryPreview(summary);
-	if (preview === "") {
-		return headline;
-	}
-	const line = `${headline} — ${preview}`;
+	const skipped = foldSkippedLine(details.skipped);
+	const head = preview === "" ? headline : withHint(`${headline} — ${preview}`, expandHint);
+	return withSkipped(head, skipped);
+}
+
+/** Append the expand hint to `line` when there is one. */
+function withHint(line: string, expandHint: string): string {
 	const hint = expandHint.trim();
 	return hint === "" ? line : `${line} (${hint})`;
 }
@@ -75,14 +93,19 @@ export function foldCollapsedText(details: FoldRenderDetails, summary: string, e
 export function foldExpandedText(details: FoldRenderDetails, summary: string): string {
 	const headline = foldHeadline(details);
 	const body = summary.trim();
-	if (body === "") {
-		return headline;
-	}
-	const indented = body
-		.split("\n")
-		.map((line) => (line === "" ? line : `  ${line}`))
-		.join("\n");
-	return `${headline}\n${indented}`;
+	const skipped = foldSkippedLine(details.skipped);
+	const head = body === ""
+		? headline
+		: `${headline}\n${body
+				.split("\n")
+				.map((line) => (line === "" ? line : `  ${line}`))
+				.join("\n")}`;
+	return withSkipped(head, skipped);
+}
+
+/** Append the skip-count line under `head` when there is one. */
+function withSkipped(head: string, skipped: string): string {
+	return skipped === "" ? head : `${head}\n${skipped}`;
 }
 
 /** Pick the view for the current expand state. */

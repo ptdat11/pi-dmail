@@ -52,8 +52,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { FOLD_TYPE, foldContext, numberSteps, type FoldRecord, type NumberedStep } from "./fold.ts";
-import { type FoldRenderDetails, foldResultText } from "./render.ts";
+import {
+	FOLD_TYPE,
+	foldContext,
+	numberSteps,
+	planReplay,
+	type FoldRecord,
+	type LocatedFold,
+	type NumberedStep,
+	type ReplayPlan,
+} from "./fold.ts";
+import { type FoldRenderDetails, foldResultText, foldSkippedLine } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -167,15 +176,14 @@ function userMessage(text: string, timestamp: number): AgentMessage {
 }
 
 /**
- * Read fold records from the current view.
- *
- * `buildContextEntries()` is the right source: it is already scoped to the active
- * branch and already accounts for Pi's own compaction, so records on an abandoned
- * branch, or on the far side of a compaction boundary, are invisible rather than
- * wrongly replayed.
+ * Read every fold record on the active branch, tagged with the entry that holds
+ * it, so a replay plan can split the ones still inside the compaction view from
+ * the ones a boundary pushed out. Reading the branch (not the view) is what makes
+ * an out-of-view record countable instead of silently absent; whether it may
+ * replay is `planReplay`'s era check on `holderEntryId`.
  */
-function readFolds(entries: readonly SessionEntry[]): FoldRecord[] {
-	const folds: FoldRecord[] = [];
+function readFolds(entries: readonly SessionEntry[]): LocatedFold[] {
+	const folds: LocatedFold[] = [];
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== FOLD_TYPE) continue;
 		const data = entry.data as Partial<FoldRecord> | undefined;
@@ -187,9 +195,20 @@ function readFolds(entries: readonly SessionEntry[]): FoldRecord[] {
 			toEntryId: data.toEntryId,
 			summary: data.summary,
 			fromStep: typeof data.fromStep === "number" ? data.fromStep : undefined,
+			holderEntryId: entry.id,
 		});
 	}
 	return folds;
+}
+
+/**
+ * Plan a replay for the current view: era split first, then validation — so the
+ * count is exactly what replay would skip. Both call sites (context hook and
+ * tool result) go through here; if they planned separately, the tool could
+ * report a number the hook does not agree with.
+ */
+function planForView(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): ReplayPlan {
+	return planReplay(entries, readFolds(branch), { isStepStart: isAssistantEntry });
 }
 
 export default function dmail(pi: ExtensionAPI): void {
@@ -321,7 +340,12 @@ export default function dmail(pi: ExtensionAPI): void {
 			// has been folded away. Markers are only emitted for steps still in view.
 			const stepOfEntry = new Map(stepsIn(ctx.sessionManager.getBranch()).map((s) => [s.entryId, s.step]));
 
-			const result = foldContext<SessionEntry, AgentMessage>(entries, readFolds(entries), {
+			// Era split first: records a compaction boundary pushed out of the view are
+			// skipped (never replayed), while everything still in view replays exactly
+			// as before.
+			const plan = planForView(entries, ctx.sessionManager.getBranch());
+
+			const result = foldContext<SessionEntry, AgentMessage>(entries, plan.inEra, {
 				convert: (entry) => sessionEntryToContextMessages(entry),
 				summaryMessage: (wrappedText) => userMessage(wrappedText, Date.now()),
 				beforeEntry: (entry) => {
@@ -365,8 +389,12 @@ export default function dmail(pi: ExtensionAPI): void {
 				);
 			}
 
-			const branchSteps = stepsIn(ctx.sessionManager.getBranch());
+			const branch = ctx.sessionManager.getBranch();
+			const branchSteps = stepsIn(branch);
 			const entries = ctx.sessionManager.buildContextEntries();
+			// Planned before appending: the record this call is about to write is not in
+			// the `entries` snapshot, so reading it here would miscount it as orphaned.
+			const { skipped } = planForView(entries, branch);
 			const visible = new Set(entries.map((entry) => entry.id));
 			const visibleSteps = branchSteps.filter((step) => visible.has(step.entryId));
 			const listed = visibleSteps.map((step) => step.step).join(", ") || "none";
@@ -409,11 +437,16 @@ export default function dmail(pi: ExtensionAPI): void {
 				// Ignore.
 			}
 
+			// Skipped records are counted, never dropped silently: the count rides the
+			// result so every view of it (raw fallback, collapsed, expanded) can say so.
+			const skipLine = foldSkippedLine(skipped.length);
+			const hasSkips = skipLine !== "";
+			const headline = `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`;
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`,
+						text: hasSkips ? `${headline}\n${skipLine}` : headline,
 					},
 				],
 				details: {
@@ -421,6 +454,7 @@ export default function dmail(pi: ExtensionAPI): void {
 					throughStep: through,
 					fromEntryId: target.entryId,
 					toEntryId: current.entryId,
+					...(hasSkips ? { skipped: skipped.length } : {}),
 				},
 			};
 		},

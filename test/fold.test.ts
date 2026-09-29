@@ -14,7 +14,16 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { foldContext, numberSteps, wrapSummary, type FoldOptions, type FoldRecord, type FoldResult } from "../fold.ts";
+import {
+	foldContext,
+	numberSteps,
+	planReplay,
+	wrapSummary,
+	type FoldOptions,
+	type FoldRecord,
+	type FoldResult,
+	type LocatedFold,
+} from "../fold.ts";
 
 /** One transcript node. `step` marks assistant messages (step boundaries); `tool` marks their results. */
 interface Entry {
@@ -321,4 +330,58 @@ test("changed is true only when the output differs from a plain conversion", () 
 
 test("wrapSummary trims and wraps in the stable tags", () => {
 	assert.equal(wrapSummary("  padded  "), "<summary>\npadded\n</summary>");
+});
+
+// ---------------------------------------------------------------------------
+// Orphan skips: records written before the boundary of the last compaction.
+// The era check runs on the record's *holder*, so a record whose endpoints are
+// still in view cannot slip across the boundary and fold the current era.
+// ---------------------------------------------------------------------------
+
+/** A record paired with the id of the session entry that holds it. */
+const held = (holderEntryId: string, from: string, to: string, summary: string, fromStep?: number): LocatedFold => ({
+	holderEntryId,
+	...rec(from, to, summary, fromStep),
+});
+
+const planOpts = { isStepStart: (entry: Entry) => entry.kind === "step" };
+
+test("a record held outside the era is counted, never replayed", () => {
+	// The holder left the view with the last compaction, but both endpoints are
+	// still in the view — without the era check this orphan would fold the ladder
+	// it has no business touching.
+	const orphan = held("gone", "a1", "a4", "written before the compaction", 1);
+	const live = held("r3", "a1", "a2", "still in era", 1);
+
+	const plan = planReplay(ladder(), [orphan, live], planOpts);
+	assert.deepEqual(plan.inEra, [live], "only in-era records may reach replay");
+	assert.deepEqual(plan.skipped, [{ fold: orphan, why: "record-out-of-era" }], "and the orphan is counted");
+
+	// Counted ≠ rendered: replaying the in-era records shows nothing of the orphan.
+	assert.ok(!render(ladder(), plan.inEra).some((line) => line.includes("written before the compaction")));
+});
+
+test("in-era records that fail validation are counted too", () => {
+	const blank = held("r3", "a1", "a2", "   ");
+	const plan = planReplay(ladder(), [blank], planOpts);
+	assert.deepEqual(plan.inEra, [], "a blank summary takes no effect");
+	assert.deepEqual(plan.skipped, [{ fold: blank, why: "blank-summary" }]);
+});
+
+test("an all-valid, all-in-era set skips nothing", () => {
+	const folds = [held("r3", "a1", "a2", "S1", 1), held("r3", "a2", "a4", "S2", 2)];
+	const plan = planReplay(ladder(), folds, planOpts);
+	assert.equal(plan.inEra.length, 2);
+	assert.equal(plan.skipped.length, 0, "N = 0: nothing to report");
+});
+
+test("planning is deterministic and never rewrites a record", () => {
+	const folds = [held("gone", "a1", "a4", "orphan", 1), held("r3", "a1", "a2", "S1", 1)];
+	const snapshot = JSON.parse(JSON.stringify(folds));
+
+	const first = planReplay(ladder(), folds, planOpts);
+	const second = planReplay(ladder(), folds, planOpts);
+	assert.deepEqual(second, first, "the same session plans to the same split and the same count");
+	assert.equal(second.skipped.length, 1);
+	assert.deepEqual(folds, snapshot, "records are append-only: never mutated, never dropped");
 });

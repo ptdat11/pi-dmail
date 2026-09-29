@@ -13,6 +13,7 @@ import {
 	foldExpandedText,
 	foldHeadline,
 	foldResultText,
+	foldSkippedLine,
 	foldSummaryPreview,
 } from "../render.ts";
 
@@ -65,6 +66,50 @@ test("expanded view of a blank summary is just the headline", () => {
 	assert.equal(foldExpandedText({ fromStep: 3, throughStep: 8 }, "\n"), "Folded steps 3–8");
 });
 
+test("skipped line is empty when nothing was skipped", () => {
+	assert.equal(foldSkippedLine(undefined), "");
+	assert.equal(foldSkippedLine(0), "");
+});
+
+test("skipped line names the count", () => {
+	assert.equal(foldSkippedLine(2), "folds skipped: 2");
+	assert.equal(foldSkippedLine(1), "folds skipped: 1");
+});
+
+test("collapsed text appends the skipped line only when N > 0", () => {
+	assert.equal(
+		foldCollapsedText({ fromStep: 3, throughStep: 8, skipped: 2 }, "Ran the suite", "ctrl+o to expand"),
+		"Folded steps 3–8 — Ran the suite (ctrl+o to expand)\nfolds skipped: 2",
+	);
+	assert.equal(
+		foldCollapsedText({ fromStep: 3, throughStep: 8, skipped: 0 }, "Ran the suite", "ctrl+o to expand"),
+		"Folded steps 3–8 — Ran the suite (ctrl+o to expand)",
+	);
+	assert.equal(
+		foldCollapsedText({ fromStep: 3, throughStep: 8 }, "Ran the suite", "ctrl+o to expand"),
+		"Folded steps 3–8 — Ran the suite (ctrl+o to expand)",
+	);
+});
+
+test("expanded view appends the skipped line after the summary", () => {
+	assert.equal(
+		foldExpandedText({ fromStep: 3, throughStep: 8, skipped: 2 }, "Ran the suite\n8 passed"),
+		"Folded steps 3–8\n  Ran the suite\n  8 passed\nfolds skipped: 2",
+	);
+	assert.equal(
+		foldExpandedText({ fromStep: 3, throughStep: 8, skipped: 0 }, "Ran the suite"),
+		"Folded steps 3–8\n  Ran the suite",
+	);
+});
+
+test("a skipped count still shows when the summary is blank", () => {
+	assert.equal(
+		foldCollapsedText({ fromStep: 3, skipped: 1 }, "  ", "ctrl+o to expand"),
+		"Folded step 3\nfolds skipped: 1",
+	);
+	assert.equal(foldExpandedText({ fromStep: 3, skipped: 1 }, "\n"), "Folded step 3\nfolds skipped: 1");
+});
+
 test("foldResultText switches on the expand state", () => {
 	const details = { fromStep: 3, throughStep: 8 };
 	assert.equal(
@@ -72,4 +117,16 @@ test("foldResultText switches on the expand state", () => {
 		"Folded steps 3–8 — Ran the suite (ctrl+o to expand)",
 	);
 	assert.equal(foldResultText(details, "Ran the suite", "ctrl+o to expand", true), "Folded steps 3–8\n  Ran the suite");
+});
+
+test("foldResultText passes the skipped count through both views", () => {
+	const details = { fromStep: 3, throughStep: 8, skipped: 3 };
+	assert.equal(
+		foldResultText(details, "Ran the suite", "ctrl+o to expand", false),
+		"Folded steps 3–8 — Ran the suite (ctrl+o to expand)\nfolds skipped: 3",
+	);
+	assert.equal(
+		foldResultText(details, "Ran the suite", "ctrl+o to expand", true),
+		"Folded steps 3–8\n  Ran the suite\nfolds skipped: 3",
+	);
 });

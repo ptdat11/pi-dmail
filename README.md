@@ -98,9 +98,11 @@ Three properties, stated plainly, because they are what make this safe:
   never separate an assistant message from the tool results that answer it — that is a hard provider
   error, so `fold.ts` refuses any range that would cause it.
 
-Folding also stays out of pi's way: records are read from the active branch of the current view, so folds
-on an abandoned branch, or on the far side of a compaction boundary, are invisible rather than wrongly
-replayed.
+Folding also stays out of pi's way: records are read from the active branch, then split by the current
+view's compaction boundary. A fold on an abandoned branch, or written before the boundary of the last
+compaction, is never replayed — and it is counted, not erased: the fold result reports
+`folds skipped: N` whenever N is greater than zero, so a skip is always explainable. The records
+themselves are never rewritten.
 
 ## Measuring the effect
 
@@ -134,9 +136,10 @@ observable. Output spend is unaffected, so prompt-side spend is printed as the c
   discoverable.
 - `send_dmail` refuses a step that has already been folded out of view, and refuses the step the agent is
   currently in — there is nothing finished to fold yet.
-- Tests: `npm test` runs node's built-in runner over `test/profile.test.ts` and `test/settings.test.ts`
-  (18 tests covering the profiler, including the fold replay math it shares with the extension, the
-  cost/`$saved` derivation, and the `settings.json` default-mode reader).
+- Tests: `npm test` runs node's built-in runner over every `test/**/*.test.ts` — the fold algebra
+  (including the era split that counts orphaned records), the replay/refold wiring, the result renderer,
+  orphan-visibility acceptance, the harness smoke tests, the profiler, and the `settings.json` default-mode
+  reader.
 
 ## License
 
