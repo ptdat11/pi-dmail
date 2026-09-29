@@ -9,6 +9,7 @@
     "fold.ts",
     "render.ts",
     "picker.ts",
+    "picker-ui.ts",
     "settings.ts",
     "profile.ts",
     "POLICY.md",

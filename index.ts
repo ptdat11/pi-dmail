@@ -79,7 +79,8 @@ import {
 	foldSummaryPreview,
 } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
-import { buildFoldPickerRows, estimateLine, type FoldPickerRow } from "./picker.ts";
+import { buildFoldPickerRows, estimateLine, ESTIMATE_LEGEND, PICKER_TITLE, type FoldPickerRow } from "./picker.ts";
+import { FoldPickerComponent } from "./picker-ui.ts";
 
 /**
  * The message shape pi records entries with. pi used to export `AgentMessage`
@@ -203,20 +204,38 @@ function userMessage(text: string, timestamp: number): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp };
 }
 
-/** All text parts of an entry (the picker preview keeps the first line); blank for non-text entries. */
+// The message object of an entry when the entry is a message. AgentMessage is
+// a union; only message-shaped members carry role/content, so both readers go
+// through this one structural view instead of casting at each use site.
+function messageOf(entry: SessionEntry | undefined): { role?: unknown; content?: unknown } | undefined {
+	if (!entry || entry.type !== "message") return undefined;
+	return entry.message as { role?: unknown; content?: unknown };
+}
+
+// The previewable text of an entry: text parts, plus tool calls as
+// `<tool_name>: <params>` (the /tree row format) so a bare tool-call step
+// isn't blank. The picker preview keeps the first line.
 function entryText(entry: SessionEntry | undefined): string {
-	if (!entry || entry.type !== "message") return "";
-	// AgentMessage is a union; only the message-shaped members carry content.
-	const content = (entry.message as { content?: unknown }).content;
+	const content = messageOf(entry)?.content;
 	if (typeof content === "string") return content;
 	if (!Array.isArray(content)) return "";
 	return content
-		.map((part) =>
-			part && typeof part === "object" && "text" in part
-				? String((part as { text?: unknown }).text ?? "")
-				: "",
-		)
+		.map((part): string => {
+			if (!part || typeof part !== "object") return "";
+			const block = part as { type?: unknown; text?: unknown; name?: unknown; arguments?: unknown };
+			if (block.type === "toolCall") {
+				const params = JSON.stringify(block.arguments ?? {});
+				return `${String(block.name ?? "tool")}: ${params}`;
+			}
+			return "text" in block ? String(block.text ?? "") : "";
+		})
 		.join("\n");
+}
+
+/** The role of a step's entry message (the picker labels each row with it). */
+function entryRole(entry: SessionEntry | undefined): string | undefined {
+	const role = messageOf(entry)?.role;
+	return typeof role === "string" ? role : undefined;
 }
 
 /**
@@ -591,13 +610,14 @@ export default function dmail(pi: ExtensionAPI): void {
 			steps: visible,
 			current,
 			folds: plan.inEra,
+			roleOf: (step) => entryRole(entryById.get(step.entryId)),
 			previewOf: (step) => foldSummaryPreview(entryText(entryById.get(step.entryId))),
 			estimateOf: (fromStep) => {
 				// One estimateWalk per row, memoised across redraws of the same rows.
 				if (estimates.has(fromStep)) return estimates.get(fromStep);
 				const target = visible.find((step) => step.step === fromStep);
 				let line: string | undefined;
-				if (target && target.step !== current.step) {
+				if (target) {
 					const planForStart = estimateFold(entries, target, current, PRICE_SUMMARY_SAMPLE, plan.skipped.length, ctx);
 					line = estimateLine(planForStart.economics.removedTokens);
 				}
@@ -623,6 +643,15 @@ export default function dmail(pi: ExtensionAPI): void {
 			}
 		};
 
+		// A pick from either dialog: find the row it names, or report the cancel.
+		const pinChosen = (row: FoldPickerRow | undefined): void => {
+			if (!row) {
+				ctx.ui.notify("Cancelled — nothing was folded.", "info");
+				return;
+			}
+			pin(row);
+		};
+
 		// Explicit start: `/dmail fold 2` — the headless way to pin a row.
 		const arg = rest.trim();
 		if (arg !== "") {
@@ -642,29 +671,41 @@ export default function dmail(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// No dialog-capable UI (print/json mode, missing select): print the list.
-		const interactive = ctx.hasUI !== false && typeof ctx.ui.select === "function";
-		if (!interactive) {
-			ctx.ui.notify(
-				[
-					`No interactive picker here — pin a start with /${invocation} <step>:`,
-					...rows.map((row) => `· ${row.label}`),
-				].join("\n"),
-				"info",
+		// The /tree-style TUI picker when a TUI can host it, ui.select for rpc-style
+		// UIs, and the printed list to keep headless sessions working.
+		if (ctx.hasUI !== false && typeof ctx.ui.custom === "function") {
+			const chosen = await ctx.ui.custom<number | undefined>(
+				(tui, theme, keybindings, done) =>
+					new FoldPickerComponent({
+						rows,
+						theme,
+						terminalRows: tui.terminal?.rows ?? 40,
+						keybindings,
+						onSelect: done,
+						onCancel: () => done(undefined),
+					}),
 			);
+			pinChosen(chosen === undefined ? undefined : rows.find((candidate) => candidate.fromStep === chosen));
 			return;
 		}
 
-		const chosen = await ctx.ui.select(
-			"Fold from which step? The step you are in is kept.",
-			rows.map((row) => row.label),
-		);
-		const row = chosen === undefined ? undefined : rows.find((candidate) => candidate.label === chosen);
-		if (!row) {
-			ctx.ui.notify("Cancelled — nothing was folded.", "info");
+		if (ctx.hasUI !== false && typeof ctx.ui.select === "function") {
+			const chosen = await ctx.ui.select(
+				`${PICKER_TITLE} The step you are in is kept. ${ESTIMATE_LEGEND}.`,
+				rows.map((row) => row.label),
+			);
+			pinChosen(chosen === undefined ? undefined : rows.find((candidate) => candidate.label === chosen));
 			return;
 		}
-		pin(row);
+
+		// No dialog-capable UI (print/json mode): print the list.
+		ctx.ui.notify(
+			[
+				`No interactive picker here — pin a start with /${invocation} <step>: ${ESTIMATE_LEGEND}.`,
+				...rows.map((row) => `· ${row.label}`),
+			].join("\n"),
+			"info",
+		);
 	}
 
 	pi.registerCommand(COMMAND_NAME, {

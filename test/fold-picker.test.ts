@@ -6,10 +6,17 @@
  * already-folded regions — and selecting a row pins only the START. The pinned
  * start reaches the agent through the standard prompt path (plain when idle,
  * `{deliverAs:"followUp"}` when the agent is busy), `/send-dmail` is an alias
- * of `/dmail fold`, and cancelling and headless sessions change nothing.
+ * of the same command, and cancelling and headless sessions change nothing.
+ *
+ * The TUI path is pi's `ui.custom` (a scrollable /tree-style component); fake-ui
+ * records the component so tests can read the rows and the rendered lines
+ * without a live terminal. Missing `custom` falls back to `ui.select`; missing
+ * interactive UI falls back to a printed list.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { FoldPickerComponent } from "../picker-ui.ts";
+import type { FoldPickerRow } from "../picker.ts";
 import { assertFoldDetails, CANCEL, createHarness, SessionFixture } from "./harness/index.ts";
 
 /** The pinned prompt as text, whatever type sendUserMessage recorded. */
@@ -36,31 +43,39 @@ function foldedFiveStepSession(): SessionFixture {
 	return fx;
 }
 
-/** First `/dmail fold` with a cancel: records the row list without pinning anything. */
-async function captureOptions(h: Harness): Promise<readonly string[]> {
-	h.ui.scriptSelect(CANCEL);
+/** First `/dmail fold` with a cancel: records the component without pinning anything. */
+async function captureRows(h: Harness): Promise<FoldPickerRow[]> {
+	h.ui.scriptCustom(CANCEL);
 	await h.runCommand("dmail", "fold");
-	return h.ui.selects[0].options;
+	return [...(h.ui.customs[0].component as FoldPickerComponent).rows];
 }
 
-test("the selector lists every finished step with previews and ~Nk estimates, region collapsed", async () => {
+test("the picker lists every finished step with role, peek and a quiet ~Nk estimate, region collapsed", async () => {
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	const options = await captureOptions(h);
+	const labels = (await captureRows(h)).map((row) => row.label);
 
 	assert.deepEqual(
-		options.map((o) => o.split(" · ")[0]),
-		["Step 1", "Folded step 2", "Step 3", "Step 4"],
-		"one row per visible step, the folded step collapsed to its original range",
+		labels.map((label) => label.split("  ")[0]),
+		["1", "[2]", "3", "4"],
+		"one row per visible step, the folded step collapsed to its bracketed range",
 	);
-	for (const label of options) {
-		assert.match(label, / ~.*tokens (removed|added)$/, `row carries a token estimate: ${label}`);
+	for (const label of labels) {
+		assert.match(label, / ~\+?\d[\d.]*k?$/, `row carries a quiet ~Nk estimate: ${label}`);
 	}
-	assert.match(options[0], /^Step 1 · alpha one — the goal and the constraints decided there · ~/);
-	assert.match(options[3], /^Step 4 · alpha four — invitations sent · ~/);
-	assert.ok(!options[3].includes("secret second line"), "preview is the first line only");
-	assert.match(h.ui.selects[0].title, /step you are in is kept/);
+	assert.match(labels[0], /^1  assistant: alpha one — the goal and the constraints decided there  ~/);
+	assert.match(labels[1], /^\[2\]  fold: Venue booked: the hall\.  ~/, "the region row peeks at its summary");
+	assert.match(labels[3], /^4  assistant: alpha four — invitations sent  ~/);
+	assert.ok(!labels[3].includes("secret second line"), "preview is the first line only");
+
+	// What the TUI actually renders: title, legend, cursor, position footer.
+	const lines = (h.ui.customs[0].component as FoldPickerComponent).render(120).join("\n");
+	assert.match(lines, /Fold from which step/, "title");
+	assert.match(lines, /latest finished step/, "legend: the end resolves to the latest finished step");
+	assert.match(lines, /~ ≈ tokens this cut removes/, "legend explains the quiet estimate");
+	assert.match(lines, /› /, "cursor marks the selected row");
+	assert.match(lines, /\(1\/4\)/, "position footer");
 
 	// Cancelling changes nothing.
 	assert.equal(h.pi.sentMessages.length, 0, "cancel sends no prompt");
@@ -72,8 +87,7 @@ test("picking a row pins only the start and delivers it through the prompt path"
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	const options = await captureOptions(h);
-	h.ui.scriptSelect(options[0]);
+	h.ui.scriptCustom(1);
 	await h.runCommand("dmail", "fold");
 
 	assert.equal(h.pi.sentMessages.length, 1, "one pinned prompt to the agent");
@@ -89,8 +103,7 @@ test("picking a collapsed folded-region row is a legal start", async () => {
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	const options = await captureOptions(h);
-	h.ui.scriptSelect(options[1]); // the "Folded step 2" row
+	h.ui.scriptCustom(2); // the "[2]  fold: …" row
 	await h.runCommand("dmail", "fold");
 
 	assert.equal(h.pi.sentMessages.length, 1);
@@ -118,6 +131,7 @@ test("a busy agent gets the pinned start through the follow-up delivery variant"
 
 	assert.equal(h.pi.sentMessages[0].options?.deliverAs, "followUp");
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /finishes the current turn/);
+	assert.equal(h.ui.customs.length, 0, "an explicit start never opens the picker");
 });
 
 test("without an interactive UI the printed list still lets the user pin a start", async () => {
@@ -129,13 +143,36 @@ test("without an interactive UI the printed list still lets the user pin a start
 
 	const printed = h.ui.notifications.at(-1)?.message ?? "";
 	assert.match(printed, /pin a start with \/dmail fold <step>/);
-	assert.match(printed, /Folded step 2/, "the fallback list is the same row set");
-	assert.match(printed, /Step 4 · alpha four — invitations sent/);
+	assert.match(printed, /· \[2\]  fold: Venue booked: the hall\./, "the fallback list is the same row set");
+	assert.match(printed, /· 4  assistant: alpha four — invitations sent/);
 	assert.equal(h.pi.sentMessages.length, 0, "the printed list itself pins nothing");
 
 	await h.runCommand("dmail", "fold 2");
 	assert.equal(h.pi.sentMessages.length, 1, "an explicit start pins without any picker");
 	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 2 through step 4/);
+});
+
+test("with ui.select but no ui.custom (rpc-style) the plain list still pins", async () => {
+	const h = await createHarness({ fixture: foldedFiveStepSession() });
+	await h.start();
+	delete (h.ctx.ui as { custom?: unknown }).custom;
+
+	h.ui.scriptSelect(CANCEL);
+	await h.runCommand("dmail", "fold");
+	assert.equal(h.ui.selects.length, 1, "falls back to ui.select");
+	assert.match(h.ui.selects[0].title, /Fold from which step/);
+	assert.match(h.ui.selects[0].title, /tokens this cut removes/, "the plain fallback carries the legend too");
+	const options = h.ui.selects[0].options;
+	assert.deepEqual(
+		options.map((option) => option.split("  ")[0]),
+		["1", "[2]", "3", "4"],
+		"the plain list shows the same rows",
+	);
+
+	h.ui.scriptSelect(options[0]);
+	await h.runCommand("dmail", "fold");
+	assert.equal(h.pi.sentMessages.length, 1, "picking from the plain list pins");
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 1 through step 4/);
 });
 
 test("a bad fold argument fails loudly and pins nothing", async () => {
@@ -155,8 +192,8 @@ test("the agent folds from exactly the pinned step and the user is told", async 
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	const options = await captureOptions(h);
-	h.ui.scriptSelect(options[0]); // pin step 1
+	await captureRows(h); // open once, as a user would
+	h.ui.scriptCustom(1); // pin step 1
 	await h.runCommand("dmail", "fold");
 
 	// The agent authors the summary and performs the fold itself.
@@ -181,17 +218,19 @@ test("/send-dmail is an alias of /dmail fold: same picker, same pin path", async
 	await h.start();
 
 	// Capture the row list through /dmail fold, then prove /send-dmail opens it.
-	h.ui.scriptSelect(CANCEL);
-	await h.runCommand("dmail", "fold");
-	const foldRows = h.ui.selects[0].options;
+	const foldRows = await captureRows(h);
 
-	h.ui.scriptSelect(CANCEL);
+	h.ui.scriptCustom(CANCEL);
 	await h.runCommand("send-dmail");
-	assert.deepEqual(h.ui.selects[1].options, [...foldRows], "the alias opens the identical picker");
+	assert.deepEqual(
+		[...(h.ui.customs[1].component as FoldPickerComponent).rows],
+		[...foldRows],
+		"the alias opens the identical picker",
+	);
 	assert.equal(h.pi.sentMessages.length, 0, "cancel through the alias changes nothing");
 
 	// Picking through /send-dmail pins the same start via the same prompt path.
-	h.ui.scriptSelect(foldRows[0]); // "Step 1 …"
+	h.ui.scriptCustom(1);
 	await h.runCommand("send-dmail");
 	assert.equal(h.pi.sentMessages.length, 1);
 	assert.match(
@@ -227,4 +266,27 @@ test("/send-dmail shares /dmail fold's guards", async () => {
 	await h.runCommand("send-dmail");
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /D-Mail is off, so there is nothing to fold/);
 	assert.equal(h.pi.sentMessages.length, 0, "a refused alias pins nothing");
+});
+
+test("a tool-call step previews like /tree: <tool_name>: <params>", async () => {
+	const fx = new SessionFixture();
+	fx.user("q1");
+	fx.assistant("alpha one — first step");
+	fx.user("q2");
+	fx.toolCall("Bash", { command: "ls -la" });
+	fx.user("q3");
+	fx.assistant("alpha three — last step");
+	const h = await createHarness({ fixture: fx });
+	await h.start();
+
+	const labels = (await captureRows(h)).map((row) => row.label);
+	assert.deepEqual(
+		labels.map((label) => label.split("  ")[0]),
+		["1", "2"],
+		"the step you are in is never a row",
+	);
+	assert.ok(
+		labels[1].startsWith('2  assistant: Bash: {"command":"ls -la"}'),
+		`the tool-call step carries its call instead of a blank peek: ${labels[1]}`,
+	);
 });
