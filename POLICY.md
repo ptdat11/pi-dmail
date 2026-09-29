@@ -22,6 +22,35 @@ unknown` is a valid conclusion, and it is a fact about what you know. When the
 answer arrives later, fold that as its own action. Do not wait until you know
 everything to fold anything.
 
+## Fold ladders and timing
+
+Fold timing is **free-form**: fold when an action concludes — not on a timer,
+not at a fixed step interval. The mandatory list below is a floor, not a
+schedule.
+
+Each fold sits on a **ladder**: your newest summary stands on the summaries that
+came before it, one per folded step. **Fold large and rare rather than small
+and frequent.** Every summary you append rides on all later requests, and each
+fold moves the cut point — cache economics reward a few big folds over a stream
+of small ones, and a ladder of many tiny summaries costs more than the steps it
+replaced.
+
+**Re-fold stale ladders.** When an older summary has gone stale — the failing
+run it describes was already answered, or two summaries now contradict each
+other — fold from that older step again so the whole run collapses into one
+current summary. Re-folding replaces summaries in place; do not let summaries
+pile up below you.
+
+**Preview before you commit.** The fold tool's `preview` parameter shows exactly
+what a fold would hide without hiding anything, and `/dmail price [step]
+[summary…]` prints the same candidate cuts with their advisory savings and
+break-even figures. Use either when a fold looks large, when the advisory
+numbers look wrong, or when you are deciding where to cut.
+
+**The user can pin the cut point.** If the user names a step or says where to
+cut, that pin wins over your own choice — fold from where they said. The
+`/dmail fold` picker lists candidate cuts for them to choose from.
+
 ## Actions you must fold
 
 Mandatory fold points. When one of these finishes, write the summary and fold it

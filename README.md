@@ -85,6 +85,35 @@ Project settings override global ones. Anything else — key absent, unparseable
 value — means on. `--dmail-disabled` overrides both, and `/dmail` overrides everything for the current
 session. The `/dmail` toggle is deliberately session-local; only the starting mode is read from settings.
 
+## Fold ladders and timing
+
+When a fold happens is the agent's call, and it is deliberately not scripted — the mandatory folds in the
+injected policy are a floor, not a schedule. Four habits shape the timing, and all four are spelled out in
+`POLICY.md` so the agent states them rather than improvising them:
+
+- **Fold large and rare, not small and frequent.** A summary replaces a finished stretch on *every*
+  subsequent request, so one fold that removes a large range pays back far more than several small ones —
+  and each fold moves the cut point forward, so small folds spend their savings chasing it. Fold big
+  finished ranges at natural seams; let the small stuff ride until it forms one.
+- **Re-fold stale ladders.** Folds stack: each one sits behind the summaries of the ones before it, and a
+  long session becomes a ladder of rungs. When a rung has gone stale — superseded, contradicted by what
+  came later, or already compressed once — re-fold it in place, collapsing the old summary together with
+  its finished neighbours into one fresh one. Ladders are re-folded, not appended to; summaries are
+  replaced, never accumulated.
+- **Preview before you commit.** Every fold result carries an advisory line, and `send_dmail`'s `preview`
+  parameter prints the same figures *without* folding: predicted tokens removed, predicted savings per
+  request, how many requests it takes to break even, and whether the context headroom absorbs the
+  summary. `/dmail price [step] [summary…]` is the read-only command form of the same check. These numbers
+  are advisory — a prediction from the session's own cache behaviour, not a promise — but they are the
+  cheap way to see a cut before making it.
+- **The user can pin the cut point.** `/dmail fold` (alias `/send-dmail`) opens a picker listing candidate
+  cuts with their headline figures, so you choose where the ladder rung goes instead of waiting for the
+  agent (`/send-dmail 2` pins a start without the picker). A pinned cut wins; the agent folds from there.
+
+The ladder only spans pi's current compaction window. Records written before the last compaction boundary
+are skipped rather than replayed — counted, not erased (`folds skipped: N`), and the ladder restarts above
+the boundary — so a ladder never spans a compact. Details under *Why it's safe* below.
+
 ## Why it's safe to let a model decide
 
 Three properties, stated plainly, because they are what make this safe:
@@ -138,8 +167,8 @@ observable. Output spend is unaffected, so prompt-side spend is printed as the c
   currently in — there is nothing finished to fold yet.
 - Tests: `npm test` runs node's built-in runner over every `test/**/*.test.ts` — the fold algebra
   (including the era split that counts orphaned records), the replay/refold wiring, the result renderer,
-  orphan-visibility acceptance, the harness smoke tests, the profiler, and the `settings.json` default-mode
-  reader.
+  orphan-visibility acceptance, the harness smoke tests, the policy injection (ladder guidance present when
+  on, absent when off), the profiler, and the `settings.json` default-mode reader.
 - Release gate: `npm run verify:e2e` (or `make verify-e2e`) is the hand-runnable end-to-end seam
   verification — it spawns a real local `pi --mode rpc` with a keyless fixture provider, builds a session
   with a genuine fold record through the real `send_dmail` tool, forces a compact, and asserts the
