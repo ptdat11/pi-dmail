@@ -33,6 +33,7 @@
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",
     "typecheck": "npx --yes -p typescript tsc -p tsconfig.typecheck.json",
+    "verify:e2e": "node test/e2e/verify.ts",
     "profile": "node profile.ts"
   }
 }

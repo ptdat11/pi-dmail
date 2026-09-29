@@ -1,7 +1,7 @@
 # pi-dmail release automation.
 #
 # Typical flow:   make release PATCH=patch
-# Or stepwise:    make test && make dry-run && make bump PATCH=patch && make publish
+# Or stepwise:    make test && make verify-e2e && make dry-run && make bump PATCH=patch && make publish
 #
 # Publishing needs a granular access token with "bypass 2FA" (read+write on
 # pi-dmail). Pass it via the environment so it never lands in a file at rest:
@@ -41,9 +41,16 @@ dry-run:
 test:
 	npm test
 
-# Bump, verify the tarball, test, then publish — in that order.
+# End-to-end seam verification (ticket 09): spawns a real local `pi --mode rpc`
+# with a keyless fixture provider — no network, not part of `npm test`/CI.
+.PHONY: verify-e2e
+verify-e2e:
+	npm run verify:e2e
+
+# Bump, verify the tarball, test, run the e2e seam verification, then publish —
+# in that order. The e2e gate is a release step by design, never a CI step.
 .PHONY: release
-release: bump dry-run test publish
+release: bump dry-run test verify-e2e publish
 	@echo "released $(shell node -p "require('./package.json').version") → https://www.npmjs.com/package/$(PKG)"
 
 .PHONY: status

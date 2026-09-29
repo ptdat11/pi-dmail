@@ -140,6 +140,12 @@ observable. Output spend is unaffected, so prompt-side spend is printed as the c
   (including the era split that counts orphaned records), the replay/refold wiring, the result renderer,
   orphan-visibility acceptance, the harness smoke tests, the profiler, and the `settings.json` default-mode
   reader.
+- Release gate: `npm run verify:e2e` (or `make verify-e2e`) is the hand-runnable end-to-end seam
+  verification — it spawns a real local `pi --mode rpc` with a keyless fixture provider, builds a session
+  with a genuine fold record through the real `send_dmail` tool, forces a compact, and asserts the
+  compaction summary derives from the fold summaries (folded narrative present, dropped detail absent).
+  It needs no network, prints one PASS/FAIL line per assertion plus a final `RESULT: PASS|FAIL`, and is
+  wired into `make release` as a release step — deliberately not into `npm test`/CI.
 
 ## License
 
