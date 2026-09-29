@@ -35,7 +35,9 @@
  *   would cause it.
  *
  * The algebra lives in `fold.ts`, which is pure and carries its own unit tests;
- * `test/` drives this file through a fake Pi. This file is wiring.
+ * `test/` drives this file through a fake Pi. This file is wiring — plus
+ * planFold/estimateFold, the one plan the fold, its `preview` flag, and
+ * `/dmail price` all run through, which needs the session view pi hands here.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -64,8 +66,16 @@ import {
 	type NumberedStep,
 	type ReplayPlan,
 } from "./fold.ts";
-import { evaluateEconomics } from "./economics.ts";
-import { type FoldRenderDetails, foldAdvisoryText, foldResultText, foldSkippedLine } from "./render.ts";
+import { evaluateEconomics, type Economics } from "./economics.ts";
+import {
+	type FoldRenderDetails,
+	foldAdvisoryText,
+	foldEconomicsLine,
+	foldHeadline,
+	foldHeadroomLine,
+	foldResultText,
+	foldSkippedLine,
+} from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -214,6 +224,220 @@ function planForView(entries: readonly SessionEntry[], branch: readonly SessionE
 	return planReplay(entries, readFolds(branch), { isStepStart: isAssistantEntry });
 }
 
+/**
+ * The steps addressable in the current view: branch steps whose holder entry
+ * survived into the context view. Both the fold's validation and `/dmail
+ * price`'s candidate enumeration read the view through this one shape.
+ */
+function visibleStepsOf(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): NumberedStep[] {
+	const visible = new Set(entries.map((entry) => entry.id));
+	return stepsIn(branch).filter((step) => visible.has(step.entryId));
+}
+
+/** A fold fully decided: the validated range, the trimmed summary, its estimate. */
+interface FoldPlan {
+	target: NumberedStep;
+	current: NumberedStep;
+	/** The summary as a fold would record it: trimmed. */
+	summary: string;
+	/** How many fold records replay skipped when the view was planned. */
+	skipped: number;
+	economics: Economics;
+}
+
+/**
+ * Everything a fold decides before it commits: the same validation, throwing
+ * the same errors, and the same estimate. The real fold, the tool's `preview`
+ * flag, and `/dmail price` all go through here — that is what makes their
+ * numbers identical and their refusals symmetric by construction (ticket 05).
+ */
+function planFold(
+	entries: readonly SessionEntry[],
+	branch: readonly SessionEntry[],
+	fromStep: number,
+	summary: string,
+	ctx: ExtensionContext,
+): FoldPlan {
+	const branchSteps = stepsIn(branch);
+	// Planned before appending: the record this call is about to write is not in
+	// the `entries` snapshot, so reading it here would miscount it as orphaned.
+	const { skipped } = planForView(entries, branch);
+	const visibleSteps = visibleStepsOf(entries, branch);
+	const listed = visibleSteps.map((step) => step.step).join(", ") || "none";
+
+	const target = branchSteps.find((step) => step.step === fromStep);
+	if (!target) {
+		throw new Error(`There is no step ${fromStep}. Visible steps: [${listed}].`);
+	}
+	if (!visibleSteps.some((step) => step.entryId === target.entryId)) {
+		throw new Error(`Step ${fromStep} has already been folded out of view. Visible steps: [${listed}].`);
+	}
+	const trimmed = summary.trim();
+	if (trimmed === "") {
+		throw new Error("The summary is empty. Write what should replace the folded steps.");
+	}
+
+	// The end is resolved once, here, and frozen. Re-deriving it later would let
+	// the fold keep swallowing every step that follows it.
+	const current = visibleSteps[visibleSteps.length - 1];
+	if (!current || target.step >= current.step) {
+		throw new Error(`Step ${fromStep} is the step you are in, so there is nothing finished to fold yet.`);
+	}
+
+	return estimateFold(entries, target, current, trimmed, skipped.length, ctx);
+}
+
+/**
+ * The estimation half of a fold: walk the range, probe usage, evaluate the
+ * economics. No validation — the caller passes a range it already knows is
+ * foldable — and no side effects, so preview, fold, and price all read the
+ * same numbers off the same code.
+ */
+function estimateFold(
+	entries: readonly SessionEntry[],
+	target: NumberedStep,
+	current: NumberedStep,
+	summary: string,
+	skipped: number,
+	ctx: ExtensionContext,
+): FoldPlan {
+	// Usage is probed before the record lands so headroom describes the
+	// context this fold is deciding about, not the one it just changed.
+	let usage: { tokens: number | null; contextWindow: number } | undefined;
+	try {
+		usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+	} catch {
+		// No usage probe (or a throwing one): headroom degrades to unknown.
+	}
+
+	// Advisory economics (ticket 04): what the fold removed, what the cache
+	// will pay back, how much window headroom is left. Every fallible piece is
+	// guarded separately, so the result always carries the advisory while a
+	// fold is never refused, delayed, or altered on economic grounds.
+	//
+	// The fold replaces [fromEntryId, toEntryId): `toEntryId` is documented as
+	// "the first entry kept", so the archive is [start, end) — exactly what
+	// replay drops — and the kept suffix (the other half of the one-time fresh
+	// rewrite) starts at `end`. Both walks use replay's convert() so the
+	// counts match what replay sends.
+	let archiveTokens = 0;
+	let keptAfterTokens: number | null = 0;
+	try {
+		const start = entries.findIndex((entry) => entry.id === target.entryId);
+		const end = entries.findIndex((entry) => entry.id === current.entryId);
+		if (start < 0 || end < start) throw new Error("fold range not in the view");
+		const tokensOf = (entry: SessionEntry): number =>
+			sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateTokens(message), 0);
+		for (const entry of entries.slice(start, end)) archiveTokens += tokensOf(entry);
+		for (const entry of entries.slice(end)) keptAfterTokens += tokensOf(entry);
+	} catch {
+		// A malformed entry can hide tokens: the verdict degrades, the fold does not.
+		archiveTokens = 0;
+		keptAfterTokens = null;
+	}
+	// The memo as replay sends it: wrapSummary's <summary> wrapper is part of
+	// what replaces the archive, so it is part of what the replacement costs.
+	const memoTokens = estimateTokens(userMessage(wrapSummary(summary), Date.now()));
+	// Total by construction (clamped inputs): this cannot throw and cannot
+	// omit a verdict — that is what "always carries the advisory" means.
+	const economics = evaluateEconomics({
+		archiveTokens,
+		memoTokens,
+		keptAfterTokens,
+		contextTokens: typeof usage?.tokens === "number" ? usage.tokens : null,
+		contextWindow: typeof usage?.contextWindow === "number" ? usage.contextWindow : null,
+	});
+
+	return { target, current, summary, skipped, economics };
+}
+
+/**
+ * The memo `/dmail price` sizes candidate cuts against when no summary is
+ * given: a stand-in for a typical fold memo, so the cuts are comparable to
+ * each other. Exact numbers need the real summary — `/dmail price <step>
+ * <summary>` and the tool's `preview` flag report the same figures for the
+ * same input, because all three run through planFold/estimateFold.
+ */
+const PRICE_SUMMARY_SAMPLE =
+	"Opening exchange: the goal, the constraints decided there, and the two decisions later steps still depend on.";
+
+/**
+ * `/dmail price [step] [summary…]` — estimates without commitment. Prints
+ * through notify (the command output seam), appends nothing, and sends the
+ * agent nothing. A bad start reports the fold's own refusal as an error.
+ */
+function priceCommand(ctx: ExtensionContext, rest: string): void {
+	const entries = ctx.sessionManager.buildContextEntries();
+	const branch = ctx.sessionManager.getBranch();
+	const words = rest === "" ? [] : rest.split(/\s+/);
+	const stepToken = words[0];
+	const summaryText = words.slice(1).join(" ").trim();
+
+	if (stepToken === undefined) {
+		// Every candidate cut: a visible step with at least one finished step after it.
+		const visibleSteps = visibleStepsOf(entries, branch);
+		const current = visibleSteps[visibleSteps.length - 1];
+		const candidates = current ? visibleSteps.filter((step) => step.step < current.step) : [];
+		if (!current || candidates.length === 0) {
+			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
+			return;
+		}
+		const { skipped } = planForView(entries, branch);
+		const plans = candidates.map((target) =>
+			estimateFold(entries, target, current, PRICE_SUMMARY_SAMPLE, skipped.length, ctx),
+		);
+		const rows = plans.map(
+			(plan) =>
+				`${foldHeadline({ fromStep: plan.target.step, throughStep: plan.current.step - 1, preview: true })} · ` +
+				foldEconomicsLine({ economics: plan.economics }),
+		);
+		// Headroom and skips describe this view once, not each cut — all share them.
+		const headroom = foldHeadroomLine({ economics: plans[0].economics });
+		const skipLine = foldSkippedLine(skipped.length);
+		ctx.ui.notify(
+			[
+				"Candidate cuts (memo sized from a representative summary):",
+				...rows,
+				...(headroom === "" ? [] : [headroom]),
+				...(skipLine === "" ? [] : [skipLine]),
+				"For an exact cut: /dmail price <step> <summary> — the same numbers the preview flag reports.",
+			].join("\n"),
+			"info",
+		);
+		return;
+	}
+
+	// Strict digits: anything else never reaches the fold's own numbering, so a
+	// typo reports "not a step number" instead of a confusing "no step 0x2".
+	if (!/^\d+$/.test(stepToken)) {
+		ctx.ui.notify(`"${stepToken}" is not a step number. Try /dmail price 2.`, "error");
+		return;
+	}
+	const fromStep = Number(stepToken);
+	try {
+		const plan = planFold(entries, branch, fromStep, summaryText === "" ? PRICE_SUMMARY_SAMPLE : summaryText, ctx);
+		const details = {
+			fromStep: plan.target.step,
+			throughStep: plan.current.step - 1,
+			economics: plan.economics,
+			preview: true,
+		};
+		ctx.ui.notify(
+			[
+				`${foldHeadline(details)} — preview only, nothing folded.`,
+				foldEconomicsLine(details),
+				foldHeadroomLine(details),
+				foldSkippedLine(plan.skipped),
+			]
+				.filter((line) => line !== "")
+				.join("\n"),
+			"info",
+		);
+	} catch (error) {
+		ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+	}
+}
+
 export default function dmail(pi: ExtensionAPI): void {
 	// Session-local, deliberately. A toggle is not a setting, and it should not outlive
 	// the session that asked for it — the same choice bash-guard made. The *starting*
@@ -270,14 +494,27 @@ export default function dmail(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand(COMMAND_NAME, {
-		description: "Turn D-Mail on or off for this session. No argument toggles; also accepts on, off, status.",
+		description:
+			"Turn D-Mail on or off for this session, or price a fold. No argument toggles; also accepts on, off, status, price.",
 		handler: async (args, ctx) => {
-			const arg = args.trim().toLowerCase();
+			const trimmed = args.trim();
+			const splitAt = trimmed.search(/\s/);
+			const arg = (splitAt === -1 ? trimmed : trimmed.slice(0, splitAt)).toLowerCase();
+			const rest = splitAt === -1 ? "" : trimmed.slice(splitAt).trim();
+
+			// Price is read-only: it never toggles, never folds, never pings the agent.
+			if (arg === "price") {
+				priceCommand(ctx, rest);
+				return;
+			}
 			if (arg === "on") enabled = true;
 			else if (arg === "off") enabled = false;
 			else if (arg === "") enabled = !enabled;
 			else if (arg !== "status") {
-				ctx.ui.notify(`Unknown argument "${arg}". Use /dmail, /dmail on, /dmail off, or /dmail status.`, "warning");
+				ctx.ui.notify(
+					`Unknown argument "${arg}". Use /dmail, /dmail on, /dmail off, /dmail status, or /dmail price.`,
+					"warning",
+				);
 				return;
 			}
 
@@ -374,7 +611,8 @@ export default function dmail(pi: ExtensionAPI): void {
 		description:
 			"Fold a range of finished steps out of your context and replace them with a summary you write. " +
 			"Everything from `fromStep` up to the last completed step stops being sent; the step you are in is kept. " +
-			"Nothing is deleted from the session or from disk, so folding too much costs only a re-read.",
+			"Nothing is deleted from the session or from disk, so folding too much costs only a re-read. " +
+			"Pass `preview` to get the same estimates without folding.",
 		promptSnippet: "send_dmail — fold finished steps out of context, replacing them with a summary you write",
 		parameters: Type.Object({
 			fromStep: Type.Number({
@@ -383,6 +621,13 @@ export default function dmail(pi: ExtensionAPI): void {
 			summary: Type.String({
 				description: "What replaces the folded steps. Include everything later steps depend on.",
 			}),
+			preview: Type.Optional(
+				Type.Boolean({
+					description:
+						"Estimate only: report exactly what this fold would — same validation, same numbers — " +
+						"without appending a record or changing the view.",
+				}),
+			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			if (!enabled) {
@@ -392,111 +637,19 @@ export default function dmail(pi: ExtensionAPI): void {
 				);
 			}
 
-			const branch = ctx.sessionManager.getBranch();
-			const branchSteps = stepsIn(branch);
+			// One path decides everything: validation (identical errors) and the
+			// estimate (identical numbers) live in planFold, so this call, its own
+			// `preview` flag, and `/dmail price` cannot drift apart.
 			const entries = ctx.sessionManager.buildContextEntries();
-			// Planned before appending: the record this call is about to write is not in
-			// the `entries` snapshot, so reading it here would miscount it as orphaned.
-			const { skipped } = planForView(entries, branch);
-			const visible = new Set(entries.map((entry) => entry.id));
-			const visibleSteps = branchSteps.filter((step) => visible.has(step.entryId));
-			const listed = visibleSteps.map((step) => step.step).join(", ") || "none";
-
-			const target = branchSteps.find((step) => step.step === params.fromStep);
-			if (!target) {
-				throw new Error(`There is no step ${params.fromStep}. Visible steps: [${listed}].`);
-			}
-			if (!visible.has(target.entryId)) {
-				throw new Error(
-					`Step ${params.fromStep} has already been folded out of view. Visible steps: [${listed}].`,
-				);
-			}
-			if (params.summary.trim() === "") {
-				throw new Error("The summary is empty. Write what should replace the folded steps.");
-			}
-
-			// The end is resolved once, here, and frozen. Re-deriving it later would let
-			// the fold keep swallowing every step that follows it.
-			const current = visibleSteps[visibleSteps.length - 1];
-			if (!current || target.step >= current.step) {
-				throw new Error(
-					`Step ${params.fromStep} is the step you are in, so there is nothing finished to fold yet.`,
-				);
-			}
-
-			// Usage is probed before the record lands so headroom describes the
-			// context this fold is deciding about, not the one it just changed.
-			let usage: { tokens: number | null; contextWindow: number } | undefined;
-			try {
-				usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
-			} catch {
-				// No usage probe (or a throwing one): headroom degrades to unknown.
-			}
-
-			// Advisory economics (ticket 04): what the fold removed, what the cache
-			// will pay back, how much window headroom is left. Every fallible piece is
-			// guarded separately, so the result always carries the advisory while a
-			// fold is never refused, delayed, or altered on economic grounds.
-			//
-			// The fold replaces [fromEntryId, toEntryId): `toEntryId` is documented as
-			// "the first entry kept", so the archive is [start, end) — exactly what
-			// replay drops — and the kept suffix (the other half of the one-time fresh
-			// rewrite) starts at `end`. Both walks use replay's convert() so the
-			// counts match what replay sends.
-			let archiveTokens = 0;
-			let keptAfterTokens: number | null = 0;
-			try {
-				const start = entries.findIndex((entry) => entry.id === target.entryId);
-				const end = entries.findIndex((entry) => entry.id === current.entryId);
-				if (start < 0 || end < start) throw new Error("fold range not in the view");
-				const tokensOf = (entry: SessionEntry): number =>
-					sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateTokens(message), 0);
-				for (const entry of entries.slice(start, end)) archiveTokens += tokensOf(entry);
-				for (const entry of entries.slice(end)) keptAfterTokens += tokensOf(entry);
-			} catch {
-				// A malformed entry can hide tokens: the verdict degrades, the fold does not.
-				archiveTokens = 0;
-				keptAfterTokens = null;
-			}
-			// The memo as replay sends it: wrapSummary's <summary> wrapper is part of
-			// what replaces the archive, so it is part of what the replacement costs.
-			const memoTokens = estimateTokens(userMessage(wrapSummary(params.summary.trim()), Date.now()));
-			// Total by construction (clamped inputs): this cannot throw and cannot
-			// omit a verdict — that is what "always carries the advisory" means.
-			const economics = evaluateEconomics({
-				archiveTokens,
-				memoTokens,
-				keptAfterTokens,
-				contextTokens: typeof usage?.tokens === "number" ? usage.tokens : null,
-				contextWindow: typeof usage?.contextWindow === "number" ? usage.contextWindow : null,
-			});
-
-			pi.appendEntry<FoldRecord>(FOLD_TYPE, {
-				fromEntryId: target.entryId,
-				toEntryId: current.entryId,
-				summary: params.summary.trim(),
-				fromStep: target.step,
-				// Predicted-vs-actual rides the record as well as the result, so offline
-				// scoring (ticket 06) can read it back from the recorded session.
-				// `actual` ships null — economics never gate anything.
-				predicted: economics.predicted,
-				actual: economics.actual,
-			});
-
+			const branch = ctx.sessionManager.getBranch();
+			const plan = planFold(entries, branch, params.fromStep, params.summary, ctx);
+			const { target, current, economics, summary: trimmedSummary, skipped } = plan;
 			const through = current.step - 1;
-			// Best effort: a fold that succeeded must not be reported as a failure just
-			// because the front end could not draw a notification.
-			try {
-				ctx.ui.notify(`Folded steps ${target.step}–${through}. In effect from the next request.`, "info");
-			} catch {
-				// Ignore.
-			}
 
 			// Skipped records are counted, never dropped silently: the count rides the
 			// result so every view of it (raw fallback, collapsed, expanded) can say so.
-			const skipLine = foldSkippedLine(skipped.length);
+			const skipLine = foldSkippedLine(skipped);
 			const hasSkips = skipLine !== "";
-			const headline = `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`;
 			const details = {
 				fromStep: target.step,
 				throughStep: through,
@@ -505,14 +658,48 @@ export default function dmail(pi: ExtensionAPI): void {
 				economics,
 				predicted: economics.predicted,
 				actual: economics.actual,
-				...(hasSkips ? { skipped: skipped.length } : {}),
+				...(hasSkips ? { skipped } : {}),
 			};
 			// The raw fallback content carries the advisory too: the economics line
 			// and any headroom warning, before the skip count.
 			const advisory = foldAdvisoryText(details);
-			const text = [headline, ...(advisory === "" ? [] : [advisory]), ...(hasSkips ? [skipLine] : [])].join("\n");
+			const tail = [...(advisory === "" ? [] : [advisory]), ...(hasSkips ? [skipLine] : [])];
+
+			// Preview (ticket 05): the numbers without the commitment. Same plan,
+			// same advisory — nothing appended, no notification, the view untouched.
+			if (params.preview) {
+				const headline =
+					`Preview: steps ${target.step} through ${through} would be replaced by your summary ` +
+					`from the next request on. Nothing was appended — the view is unchanged.`;
+				return {
+					content: [{ type: "text" as const, text: [headline, ...tail].join("\n") }],
+					details: { ...details, preview: true },
+				};
+			}
+
+			pi.appendEntry<FoldRecord>(FOLD_TYPE, {
+				fromEntryId: target.entryId,
+				toEntryId: current.entryId,
+				summary: trimmedSummary,
+				fromStep: target.step,
+				// Predicted-vs-actual rides the record as well as the result, so offline
+				// scoring (ticket 06) can read it back from the recorded session.
+				// `actual` ships null — economics never gate anything.
+				predicted: economics.predicted,
+				actual: economics.actual,
+			});
+
+			// Best effort: a fold that succeeded must not be reported as a failure just
+			// because the front end could not draw a notification.
+			try {
+				ctx.ui.notify(`Folded steps ${target.step}–${through}. In effect from the next request.`, "info");
+			} catch {
+				// Ignore.
+			}
+
+			const headline = `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`;
 			return {
-				content: [{ type: "text" as const, text }],
+				content: [{ type: "text" as const, text: [headline, ...tail].join("\n") }],
 				details,
 			};
 		},
@@ -523,13 +710,12 @@ export default function dmail(pi: ExtensionAPI): void {
 		 */
 		renderResult(result, { expanded }, theme, context) {
 			const summary = typeof context.args.summary === "string" ? context.args.summary : "";
-			const text = foldResultText(
-				(result.details ?? {}) as FoldRenderDetails,
-				summary,
-				keyHint("app.tools.expand", "to expand"),
-				expanded,
-			);
-			return new Text(`${theme.fg("success", "✓")} ${text}`, 0, 0);
+			const details = (result.details ?? {}) as FoldRenderDetails;
+			const text = foldResultText(details, summary, keyHint("app.tools.expand", "to expand"), expanded);
+			// A preview must not wear the fold's checkmark: nothing succeeded yet.
+			return details.preview
+				? new Text(`${theme.fg("accent", "◌ preview (nothing folded):")} ${text}`, 0, 0)
+				: new Text(`${theme.fg("success", "✓")} ${text}`, 0, 0);
 		},
 	});
 }

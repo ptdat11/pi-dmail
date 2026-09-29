@@ -30,6 +30,9 @@ export type FoldRenderDetails = {
 	 * scoring (ticket 06), so `actual` ships null. */
 	predicted?: PredictedEconomics | null;
 	actual?: ActualEconomics | null;
+	/** True when the result is a preview (ticket 05): estimates only — the
+	 * headline reads as a proposal, and nothing was appended. */
+	preview?: boolean;
 };
 
 /** Preview budget for the collapsed line, before the expand hint. */
@@ -41,14 +44,16 @@ const PREVIEW_LIMIT = 60;
  * or malformed result looks like.
  */
 export function foldHeadline(details: FoldRenderDetails): string {
+	// A preview has not folded anything: the verb has to say so.
+	const verb = details.preview ? "Would fold" : "Folded";
 	const { fromStep, throughStep } = details;
 	if (typeof fromStep !== "number" || !Number.isFinite(fromStep)) {
-		return "Folded steps";
+		return `${verb} steps`;
 	}
 	if (typeof throughStep !== "number" || !Number.isFinite(throughStep) || throughStep === fromStep) {
-		return `Folded step ${fromStep}`;
+		return `${verb} step ${fromStep}`;
 	}
-	return `Folded steps ${fromStep}–${throughStep}`;
+	return `${verb} steps ${fromStep}–${throughStep}`;
 }
 
 /**
