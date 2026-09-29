@@ -4,9 +4,9 @@
  *
  * The picker runs off the replayed view — visible steps plus collapsed rows for
  * already-folded regions — and selecting a row pins only the START. The pinned
- * start reaches the agent through the same prompt-delivery path as
- * `/send-dmail` (including the busy follow-up variant); cancelling and headless
- * sessions change nothing.
+ * start reaches the agent through the standard prompt path (plain when idle,
+ * `{deliverAs:"followUp"}` when the agent is busy), `/send-dmail` is an alias
+ * of `/dmail fold`, and cancelling and headless sessions change nothing.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -81,7 +81,7 @@ test("picking a row pins only the start and delivers it through the prompt path"
 	assert.match(messageText(content), /pinned the cut point: fold from step 1 through step 4/, "start pinned, end is the latest finished step");
 	assert.match(messageText(content), /send_dmail\(fromStep=1/, "the agent folds from exactly the pinned step");
 	assert.match(messageText(content), /folded on their behalf/, "the agent confirms the fold to the user");
-	assert.equal(msgOptions?.deliverAs, undefined, "idle agent → plain send, like /send-dmail");
+	assert.equal(msgOptions?.deliverAs, undefined, "idle agent → plain send");
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned step 1/, "the command acknowledges the choice");
 });
 
@@ -176,20 +176,55 @@ test("the agent folds from exactly the pinned step and the user is told", async 
 	);
 });
 
-test("/send-dmail behavior is unchanged: the agent still decides everything", async () => {
-	const idle = await createHarness();
-	await idle.start();
-	await idle.runCommand("send-dmail");
+test("/send-dmail is an alias of /dmail fold: same picker, same pin path", async () => {
+	const h = await createHarness({ fixture: foldedFiveStepSession() });
+	await h.start();
 
-	assert.equal(idle.pi.sentMessages.length, 1);
-	assert.match(messageText(idle.pi.sentMessages[0].content), /earliest step still shown/);
-	assert.equal(idle.pi.sentMessages[0].options?.deliverAs, undefined, "idle nudge sends plainly");
-	assert.equal(idle.ui.notifications.length, 0, "the idle nudge stays silent");
+	// Capture the row list through /dmail fold, then prove /send-dmail opens it.
+	h.ui.scriptSelect(CANCEL);
+	await h.runCommand("dmail", "fold");
+	const foldRows = h.ui.selects[0].options;
 
-	const busy = await createHarness({ idle: false });
-	await busy.start();
-	await busy.runCommand("send-dmail");
+	h.ui.scriptSelect(CANCEL);
+	await h.runCommand("send-dmail");
+	assert.deepEqual(h.ui.selects[1].options, [...foldRows], "the alias opens the identical picker");
+	assert.equal(h.pi.sentMessages.length, 0, "cancel through the alias changes nothing");
 
-	assert.equal(busy.pi.sentMessages[0].options?.deliverAs, "followUp");
-	assert.match(busy.ui.notifications.at(-1)?.message ?? "", /D-Mail requested/);
+	// Picking through /send-dmail pins the same start via the same prompt path.
+	h.ui.scriptSelect(foldRows[0]); // "Step 1 …"
+	await h.runCommand("send-dmail");
+	assert.equal(h.pi.sentMessages.length, 1);
+	assert.match(
+		messageText(h.pi.sentMessages[0].content),
+		/pinned the cut point: fold from step 1 through step 4/,
+	);
+	assert.equal(h.pi.sentMessages[0].options?.deliverAs, undefined, "idle → plain send");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned step 1/);
+});
+
+test("/send-dmail pins an explicit start without a picker; busy → followUp", async () => {
+	const h = await createHarness({ fixture: foldedFiveStepSession(), idle: false });
+	await h.start();
+
+	// Errors and hints name the command that was actually typed.
+	await h.runCommand("send-dmail", "x");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Try \/send-dmail 2\./);
+	assert.equal(h.pi.sentMessages.length, 0);
+
+	await h.runCommand("send-dmail", "3");
+
+	assert.equal(h.pi.sentMessages.length, 1);
+	assert.equal(h.pi.sentMessages[0].options?.deliverAs, "followUp", "busy agent → followUp delivery");
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 3 through step 4/);
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /finishes the current turn/);
+});
+
+test("/send-dmail shares /dmail fold's guards", async () => {
+	const h = await createHarness({ fixture: foldedFiveStepSession() });
+	h.pi.setFlag("dmail-disabled", true);
+	await h.start();
+
+	await h.runCommand("send-dmail");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /D-Mail is off, so there is nothing to fold/);
+	assert.equal(h.pi.sentMessages.length, 0, "a refused alias pins nothing");
 });

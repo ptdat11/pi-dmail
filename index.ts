@@ -26,8 +26,8 @@
  * policy is withheld, and fold records stop being applied, so folded material comes
  * back. That is the escape hatch if a summary turns out to have dropped something.
  *
- * `/send-dmail` is the opposite nudge: it asks the agent to fold now, starting at
- * the earliest step still in view.
+ * `/send-dmail` is an alias of `/dmail fold`: the same picker, the same pinned
+ * start, the same prompt-delivery path — the user picks the cut point either way.
  *
  *   Bounded damage. A fold that no longer resolves is skipped, not applied
  *   partially, and a fold can never separate an assistant message from its tool
@@ -147,21 +147,9 @@ const OFF_MESSAGE =
 	"so anything folded earlier is back in context. Run /dmail again to re-enable.";
 
 /**
- * `/send-dmail` injects this as a user message. It is deliberately short: the
- * mechanics live in POLICY.md, so this only states the thing the user is asking
- * for. "Still shown to you" is the load-bearing phrase — it is what makes the
- * agent start at the first un-folded step rather than a number that has already
- * been folded away.
- */
-const SEND_DMAIL_PROMPT =
-	"Send D-Mail now. Fold from the earliest step still shown to you; the step you are in is kept. " +
-	"Put everything later steps depend on into the summary.";
-
-/**
- * `/dmail fold` pins a START; this is the prompt that delivers it — the same
- * prompt path as SEND_DMAIL_PROMPT (idle → plain send, busy → followUp), but the
- * cut point is fixed by the user. The agent owns the prose: it writes the
- * summary and performs the fold itself from exactly the pinned step.
+ * `/dmail fold` (and its alias `/send-dmail`) pins a START; this is the prompt
+ * that delivers it — idle → plain send, busy → followUp. The agent owns the
+ * prose: it writes the summary and performs the fold from exactly the pinned step.
  */
 function foldPinPrompt(fromStep: number, throughStep: number): string {
 	return (
@@ -533,12 +521,13 @@ export default function dmail(pi: ExtensionAPI): void {
 	 * `/dmail fold` — the user owns the cut point, the agent owns the prose.
 	 * Rows come from the replayed view (visible steps + one row per folded
 	 * region); picking a row pins only the START and hands it to the agent via
-	 * the same prompt path as /send-dmail. Cancel changes nothing; without an
-	 * interactive UI the printed list plus `/dmail fold <step>` keeps headless
-	 * sessions working.
+	 * the standard prompt path (plain when idle, followUp when busy). This one
+	 * function serves both `/dmail fold` and its alias `/send-dmail`. Cancel
+	 * changes nothing; without an interactive UI the printed list plus
+	 * `/dmail fold <step>` keeps headless sessions working.
 	 */
-	async function foldCommand(ctx: ExtensionContext, rest: string): Promise<void> {
-		// Same guards as /send-dmail: an unreachable fold helps no one.
+	async function foldCommand(ctx: ExtensionContext, rest: string, invocation: string): Promise<void> {
+		// Shared guards for /dmail fold and /send-dmail: an unreachable fold helps no one.
 		if (!enabled) {
 			ctx.ui.notify("D-Mail is off, so there is nothing to fold. Run /dmail to turn it on.", "warning");
 			return;
@@ -581,7 +570,7 @@ export default function dmail(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Deliver the pinned start exactly like /send-dmail delivers its nudge.
+		// Deliver the pinned start: plain when idle, followUp when the agent is busy.
 		const pin = (row: FoldPickerRow): void => {
 			pinnedFromStep = row.fromStep;
 			const prompt = foldPinPrompt(row.fromStep, current.step - 1);
@@ -598,7 +587,7 @@ export default function dmail(pi: ExtensionAPI): void {
 		const arg = rest.trim();
 		if (arg !== "") {
 			if (!/^\d+$/.test(arg)) {
-				ctx.ui.notify(`"${arg}" is not a step number. Try /dmail fold 2.`, "error");
+				ctx.ui.notify(`"${arg}" is not a step number. Try /${invocation} 2.`, "error");
 				return;
 			}
 			const row = rows.find((candidate) => candidate.fromStep === Number(arg));
@@ -618,7 +607,7 @@ export default function dmail(pi: ExtensionAPI): void {
 		if (!interactive) {
 			ctx.ui.notify(
 				[
-					"No interactive picker here — pin a start with /dmail fold <step>:",
+					`No interactive picker here — pin a start with /${invocation} <step>:`,
 					...rows.map((row) => `· ${row.label}`),
 				].join("\n"),
 				"info",
@@ -649,7 +638,7 @@ export default function dmail(pi: ExtensionAPI): void {
 
 			// The user picks the cut point; the agent authors the summary and folds.
 			if (arg === "fold") {
-				await foldCommand(ctx, rest);
+				await foldCommand(ctx, rest, "dmail fold");
 				return;
 			}
 			// Price is read-only: it never toggles, never folds, never pings the agent.
@@ -678,36 +667,14 @@ export default function dmail(pi: ExtensionAPI): void {
 		},
 	});
 
-	// A nudge, not a command that folds by itself: the model still owns the summary,
-	// and the step numbering it needs is already in its context as [step N] markers.
+	// The classic entry point, now an alias of `/dmail fold`: same picker, same
+	// pinned start, same delivery path. Arguments mean the same thing —
+	// `/send-dmail 2` pins a start without opening a picker.
 	pi.registerCommand("send-dmail", {
 		description:
-			"Ask the agent to fold now: it starts at the earliest step still in view and runs through the last completed step.",
-		handler: async (_args, ctx) => {
-			if (!enabled) {
-				ctx.ui.notify("D-Mail is off, so there is nothing to send. Run /dmail to turn it on.", "warning");
-				return;
-			}
-			if (!pi.getActiveTools().includes(TOOL_NAME)) {
-				ctx.ui.notify(
-					`The ${TOOL_NAME} tool is not active, so the agent cannot fold. Enable it from /tools first.`,
-					"warning",
-				);
-				return;
-			}
-			// The in-flight turn that will answer this is itself a step, so one visible
-			// step is already enough to fold. Only an empty view has nothing to work with.
-			if (stepsIn(ctx.sessionManager.buildContextEntries()).length === 0) {
-				ctx.ui.notify("Nothing to fold yet — no steps in view.", "warning");
-				return;
-			}
-
-			if (ctx.isIdle()) {
-				pi.sendUserMessage(SEND_DMAIL_PROMPT);
-				return;
-			}
-			pi.sendUserMessage(SEND_DMAIL_PROMPT, { deliverAs: "followUp" });
-			ctx.ui.notify("D-Mail requested. The agent will fold once it finishes the current turn.", "info");
+			"Pick where D-Mail folds: the same picker and pinned start as /dmail fold (an explicit step works without one).",
+		handler: async (args, ctx) => {
+			await foldCommand(ctx, args, "send-dmail");
 		},
 	});
 

@@ -58,8 +58,8 @@ is finished. What you get is a status badge and two commands:
 | Surface | What it does |
 | --- | --- |
 | Blue `D-MAIL ON` / red `⚠ D-MAIL OFF` badge | Whether folding is active, shown in the footer. |
-| `/dmail` | Toggle folding for the session. Also `/dmail on`, `/dmail off`, `/dmail status`. |
-| `/send-dmail` | Ask the agent to fold right now, from the earliest step still in view. Refused when folding is off or `send_dmail` isn't an active tool. |
+| `/dmail` | Toggle folding for the session. Also `/dmail on`, `/dmail off`, `/dmail status`, `/dmail fold`, `/dmail price`. |
+| `/send-dmail` | Alias of `/dmail fold`: opens the picker to pin where the agent folds (`/send-dmail 2` pins a start without one). Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
 | `--dmail-disabled` | Force folding off for one session, overriding settings (`/dmail` turns it back on). |
 | `dmail.enabled` in `settings.json` | Default mode for new sessions (`false` starts them off). |
 
