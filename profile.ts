@@ -33,6 +33,7 @@
  * Usage:
  *   node profile.ts <session.jsonl|session-id-prefix> [--last N] [--json] [--csv]
  *   node profile.ts --list [query] [--all] [--deep] [--json]
+ *   node profile.ts --score [session...] [--all] [--json]
  *
  * A session argument that is not a readable file is resolved the friendly way:
  * a full path, a path relative to the sessions root
@@ -43,6 +44,11 @@ import { closeSync, openSync, readFileSync, readSync, readdirSync, realpathSync,
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
+import {
+	cacheRatioOf,
+	type ActualEconomics,
+	type PredictedEconomics,
+} from "./economics.ts";
 import { FOLD_TYPE, foldContext, numberSteps, type FoldRecord } from "./fold.ts";
 
 // ============================================================================
@@ -238,7 +244,23 @@ interface FoldRecordWithId extends FoldRecord {
 	recordId: string;
 }
 
-/** Read `dmail.fold` entries, mirroring index.ts `readFolds` but keeping the id. */
+/**
+ * Ticket-04 predictions are scored only if the two numbers scoring needs
+ * exist. A malformed or partial prediction reads as "not recorded": the fold
+ * still shows up (just unscored) rather than poisoning the arithmetic.
+ */
+function isPredictedEconomics(value: unknown): value is PredictedEconomics {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Partial<PredictedEconomics>;
+	return typeof candidate.removedTokens === "number" && typeof candidate.savingsPerRequestTokens === "number";
+}
+
+/**
+ * Read `dmail.fold` entries, mirroring index.ts `readFolds` but keeping the id.
+ * The record's persisted `actual` slot is deliberately ignored: it ships null
+ * and stays null — sessions are append-only, so measured economics are
+ * re-derived by the profiler for its report and never written back (06).
+ */
 function readFolds(entries: readonly AnyEntry[]): FoldRecordWithId[] {
 	const folds: FoldRecordWithId[] = [];
 	for (const entry of entries) {
@@ -253,6 +275,7 @@ function readFolds(entries: readonly AnyEntry[]): FoldRecordWithId[] {
 			toEntryId: data.toEntryId,
 			summary: data.summary,
 			fromStep: typeof data.fromStep === "number" ? data.fromStep : undefined,
+			...(isPredictedEconomics(data.predicted) ? { predicted: data.predicted } : {}),
 		});
 	}
 	return folds;
@@ -270,6 +293,8 @@ interface MessageLists {
 	folded: AnyMessage[];
 	raw: AnyMessage[];
 	activeFoldIds: string[];
+	/** Folds whose summary was actually rendered this request (active minus suppressed). */
+	renderedFoldIds: string[];
 	skippedFolds: number;
 }
 
@@ -293,9 +318,14 @@ function buildMessageLists(
 		return step === undefined ? undefined : userMessage(`[step ${step}]`, Date.parse(entry.timestamp) || Date.now());
 	};
 
+	const renderedFoldIds: string[] = [];
 	const folded = foldContext<AnyEntry, AnyMessage>(requestEntries, folds, {
 		convert: toMessages,
-		summaryMessage: (text) => userMessage(text, Date.now()),
+		summaryMessage: (text, fold) => {
+			const recordId = (fold as FoldRecordWithId).recordId;
+			if (typeof recordId === "string" && !renderedFoldIds.includes(recordId)) renderedFoldIds.push(recordId);
+			return userMessage(text, Date.now());
+		},
 		beforeEntry: marker,
 		isStepStart: isAssistantEntry,
 	});
@@ -307,6 +337,7 @@ function buildMessageLists(
 		folded: folded.messages,
 		raw: raw.messages,
 		activeFoldIds: folded.applied.map((record) => (record as FoldRecordWithId).recordId),
+		renderedFoldIds,
 		skippedFolds: folded.skipped.length,
 	};
 }
@@ -637,6 +668,18 @@ export interface FoldProfile {
 	summaryChars: number;
 	/** Index of the first request this fold was in effect for, if ever. */
 	effectiveAtRequest: number | null;
+	/** Ticket-04 advisory economics recorded at fold time; null for pre-04 folds. */
+	predicted: PredictedEconomics | null;
+	/**
+	 * Ticket-06 measurement: the leave-one-out marginal of this fold over the
+	 * requests where its summary actually rendered, valued at the session's own
+	 * cache-read/fresh price ratio. Null when the fold never rendered (or has no
+	 * prediction — pre-04 folds are not scored). Report-only: never written back
+	 * into the session file.
+	 */
+	actual: ActualEconomics | null;
+	/** Requests where this fold's summary rendered and was measured. */
+	measuredRequests: number;
 }
 
 export interface CostBuckets {
@@ -678,6 +721,30 @@ export interface ProfileTotals {
 	meanOverhead: number | null;
 }
 
+/**
+ * The session-level price of folding: what the re-prefills at fold-start
+ * requests cost above a normal request's uncached input, versus what a
+ * request with folds active gives back.
+ */
+export interface FoldEconomics {
+	/** Requests where a new fold took effect and usage was reported. */
+	foldStarts: number;
+	/** Fold records that took effect at least once. */
+	foldsApplied: number;
+	/** foldsApplied / foldStarts; >1 means folds were batched into one re-prefill. */
+	foldsPerStart: number | null;
+	/** Median uncached input of requests that did not start a fold. */
+	baselineInput: number | null;
+	/** Uncached tokens charged above baseline at fold-start requests. */
+	excessInput: number;
+	/** Mean tokens saved per request while folds are active. */
+	meanSaved: number | null;
+	/** Requests of saving needed to repay the re-prefills; 0 when they were free. */
+	breakEvenRequests: number | null;
+	/** Dollar value of `excessInput` at the session's own input rate. */
+	excessCost: number | null;
+}
+
 export interface Profile {
 	sessionFile?: string;
 	piHelpers: boolean;
@@ -686,11 +753,20 @@ export interface Profile {
 	totals: ProfileTotals;
 	/** null when no request in the session reported `usage.cost`. */
 	cost: CostTotals | null;
+	/** null when the session applied no folds. */
+	economics: FoldEconomics | null;
 }
 
 function mean(values: number[]): number | null {
 	if (values.length === 0) return null;
 	return values.reduce((sum, value) => sum + value, 0) / values.length;
+}
+
+function median(values: number[]): number | null {
+	if (values.length === 0) return null;
+	const sorted = [...values].sort((a, b) => a - b);
+	const middle = Math.floor(sorted.length / 2);
+	return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
 function pct(numerator: number, denominator: number): number | null {
@@ -755,6 +831,38 @@ function buildCostTotals(buckets: CostBuckets & { reported: number }, totals: Pr
 }
 
 /**
+ * Fold economics for one session. `baselineInput` is the median uncached input
+ * of requests that did not start a fold — what a fold-start request would have
+ * sent without the fold — so `excessInput` is the re-prefill's genuine extra
+ * charge, and `breakEvenRequests` how many active-fold requests it takes to
+ * repay it at the observed mean saving.
+ */
+function buildFoldEconomics(
+	baselineInputs: readonly number[],
+	foldStartInputs: readonly number[],
+	requests: readonly RequestProfile[],
+	foldsApplied: number,
+	cost: CostTotals | null,
+): FoldEconomics {
+	const baseline = median(baselineInputs.length > 0 ? baselineInputs : foldStartInputs);
+	const excessInput =
+		baseline === null ? 0 : foldStartInputs.reduce((sum, value) => sum + Math.max(0, value - baseline), 0);
+	const meanSaved = mean(requests.filter((request) => request.foldsActive > 0).map((request) => request.saved));
+	const breakEvenRequests =
+		excessInput === 0 ? 0 : meanSaved !== null && meanSaved > 0 ? excessInput / meanSaved : null;
+	return {
+		foldStarts: foldStartInputs.length,
+		foldsApplied,
+		foldsPerStart: foldStartInputs.length > 0 ? foldsApplied / foldStartInputs.length : null,
+		baselineInput: baseline,
+		excessInput,
+		meanSaved,
+		breakEvenRequests,
+		excessCost: cost?.rates.input != null ? (excessInput * cost.rates.input) / 1_000_000 : null,
+	};
+}
+
+/**
  * Analyze one session, given its raw JSONL content.
  *
  * Only the active branch is profiled: abandoned branches were not the context
@@ -786,6 +894,10 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 	// Every fold record declared on the active branch, whether or not it applied.
 	const declaredFolds = readFolds(branch);
 	const effectiveAtRequest = new Map<string, number>();
+	// Leave-one-out marginals per predicted fold: sum/count of
+	// (estimate without this fold − estimate with all folds) over the requests
+	// where the fold's summary actually rendered.
+	const measurements = new Map<string, { sum: number; count: number; lastAt: string | null }>();
 
 	const requests: RequestProfile[] = [];
 	const costBuckets: CostBuckets & { reported: number } = {
@@ -797,6 +909,8 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		reported: 0,
 	};
 	let previousFoldsActive = 0;
+	const baselineInputs: number[] = [];
+	const foldStartInputs: number[] = [];
 
 	for (const entry of branch) {
 		if (!isAssistantEntry(entry)) continue;
@@ -819,6 +933,26 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		const estFolded = lists.folded.reduce((sum, m) => sum + estimateTokens(m), 0);
 		const estRaw = lists.raw.reduce((sum, m) => sum + estimateTokens(m), 0);
 
+		// Ticket 06: measure every predicted fold's marginal contribution. Only
+		// while its own summary renders — a newer re-fold that suppresses it would
+		// otherwise drag the comparison with predicted economics sideways.
+		for (const fold of foldsHere) {
+			if (!fold.predicted) continue;
+			if (!lists.renderedFoldIds.includes(fold.recordId)) continue;
+			const without = buildMessageLists(
+				requestEntries,
+				stepOfEntry,
+				toMessages,
+				foldsHere.filter((other) => other.recordId !== fold.recordId),
+			);
+			const withoutEst = without.folded.reduce((total, m) => total + estimateTokens(m), 0);
+			const acc = measurements.get(fold.recordId) ?? { sum: 0, count: 0, lastAt: null };
+			acc.sum += withoutEst - estFolded;
+			acc.count++;
+			acc.lastAt = entry.timestamp ?? acc.lastAt;
+			measurements.set(fold.recordId, acc);
+		}
+
 		const usage = message.usage;
 		const hasUsage = usage && typeof usage.input === "number";
 		const input = hasUsage ? usage.input : 0;
@@ -839,6 +973,8 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 			? calculateContextTokens(usage) - output
 			: 0;
 		const foldsActive = lists.activeFoldIds.length;
+		const foldStarted = foldsActive > previousFoldsActive;
+		if (hasUsage) (foldStarted ? foldStartInputs : baselineInputs).push(input);
 
 		requests.push({
 			index,
@@ -861,21 +997,12 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 			savedCostHigh: null,
 			overhead: hasUsage ? actualPrompt - estFolded : null,
 			foldsActive,
-			foldStarted: foldsActive > previousFoldsActive,
+			foldStarted,
 			skippedFolds: lists.skippedFolds,
 		});
 
 		previousFoldsActive = foldsActive;
 	}
-
-	const folds: FoldProfile[] = declaredFolds.map((record) => ({
-		recordId: record.recordId,
-		fromStep: record.fromStep,
-		fromEntryId: record.fromEntryId,
-		toEntryId: record.toEntryId,
-		summaryChars: record.summary.trim().length,
-		effectiveAtRequest: effectiveAtRequest.get(record.recordId) ?? null,
-	}));
 
 	const sum = (pick: (request: RequestProfile) => number): number =>
 		requests.reduce((total, request) => total + pick(request), 0);
@@ -899,8 +1026,8 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		estRaw: totalEstRaw,
 		saved: totalEstRaw - totalEstFolded,
 		savedPct: pct(totalEstRaw - totalEstFolded, totalEstRaw),
-		folds: folds.length,
-		foldsApplied: folds.filter((fold) => fold.effectiveAtRequest !== null).length,
+		folds: declaredFolds.length,
+		foldsApplied: declaredFolds.filter((record) => effectiveAtRequest.has(record.recordId)).length,
 		skippedFolds: totalSkipped,
 		meanOverhead: mean(overheads),
 	};
@@ -915,7 +1042,42 @@ export async function analyzeSession(content: string, sessionFile?: string): Pro
 		}
 	}
 
-	return { sessionFile, piHelpers: pi !== undefined, requests, folds, totals, cost };
+	// Price the measurement exactly as the prediction was priced: invert the
+	// prediction's own `savings = removed × cacheRatio` (economics.ts). The
+	// session's real cache prices stay out of it — mixing bases would let
+	// pricing alone walk accuracy across the verdict bar, and scoring must be
+	// like-for-like (ticket 06).
+	const folds: FoldProfile[] = declaredFolds.map((record) => {
+		const acc = measurements.get(record.recordId);
+		const removed = acc && acc.count > 0 ? Math.round(acc.sum / acc.count) : null;
+		const predicted = record.predicted ?? null;
+		let actual: ActualEconomics | null = null;
+		if (predicted && removed !== null) {
+			actual = {
+				measuredAt: acc?.lastAt ?? null,
+				removedTokens: removed,
+				savingsPerRequestTokens: Math.round(removed * cacheRatioOf(predicted)),
+			};
+		}
+		return {
+			recordId: record.recordId,
+			fromStep: record.fromStep,
+			fromEntryId: record.fromEntryId,
+			toEntryId: record.toEntryId,
+			summaryChars: record.summary.trim().length,
+			effectiveAtRequest: effectiveAtRequest.get(record.recordId) ?? null,
+			predicted,
+			actual,
+			measuredRequests: acc?.count ?? 0,
+		};
+	});
+
+	const economics =
+		totals.foldsApplied === 0
+			? null
+			: buildFoldEconomics(baselineInputs, foldStartInputs, requests, totals.foldsApplied, cost);
+
+	return { sessionFile, piHelpers: pi !== undefined, requests, folds, totals, cost, economics };
 }
 
 // ============================================================================
@@ -994,7 +1156,7 @@ function renderTable(profile: Profile): string {
 	return output.join("\n");
 }
 
-function renderSummary(profile: Profile): string {
+export function renderSummary(profile: Profile): string {
 	const t = profile.totals;
 	const lines: string[] = [];
 	lines.push("");
@@ -1011,6 +1173,30 @@ function renderSummary(profile: Profile): string {
 		lines.push(
 			`  mean overhead     ${fmt(t.meanOverhead)} tokens/request (system prompt + tools + framing + chars/4 estimator gap)`,
 		);
+	}
+	if (profile.economics) {
+		const e = profile.economics;
+		lines.push("");
+		lines.push("Fold economics");
+		lines.push(
+			`  fold starts       ${e.foldStarts} request${e.foldStarts === 1 ? "" : "s"} paid a re-prefill  (${e.foldsPerStart === null ? "-" : e.foldsPerStart.toFixed(2)} folds applied per start)`,
+		);
+		lines.push(
+			`  baseline input    ${e.baselineInput === null ? "-" : fmt(e.baselineInput)} tokens/request before any fold`,
+		);
+		lines.push(
+			`  excess input      ${fmt(e.excessInput)} tokens above baseline at fold starts  (${fmtDollars(e.excessCost)})`,
+		);
+		lines.push(
+			`  mean saving       ${e.meanSaved === null ? "-" : fmt(e.meanSaved)} tokens/request while folds are active`,
+		);
+		const breakEven =
+			e.breakEvenRequests === null
+				? "n/a (no positive per-request saving)"
+				: e.breakEvenRequests === 0
+					? "0 (fold re-prefills cost nothing above baseline)"
+					: `${e.breakEvenRequests.toFixed(1)} requests of saving repay the re-prefill`;
+		lines.push(`  break-even        ${breakEven}`);
 	}
 	lines.push("");
 	lines.push("Cost");
@@ -1042,12 +1228,222 @@ function renderSummary(profile: Profile): string {
 			);
 		}
 	}
+	// Ticket 06: per-fold predicted-vs-measured. Report-only — the session file
+	// is append-only and never learns these numbers.
+	const predictedFolds = profile.folds.filter(
+		(fold): fold is FoldProfile & { predicted: PredictedEconomics } => fold.predicted !== null,
+	);
+	if (predictedFolds.length > 0) {
+		lines.push("");
+		lines.push("Fold scoring");
+		for (const fold of predictedFolds) {
+			const predicted = fold.predicted;
+			const label = `  step ${fold.fromStep ?? "?"}  predicted ${fmt(predicted.removedTokens)} removed · ${fmt(predicted.savingsPerRequestTokens)}/req`;
+			const measured = fold.actual;
+			if (!measured) {
+				lines.push(`${label}  measured: not measured (summary never rendered)`);
+				continue;
+			}
+			const removed = measured.removedTokens === null ? "-" : fmt(measured.removedTokens);
+			// Pricing comes from the prediction's own cache ratio, so this branch
+			// only guards the nullable ticket-04 type — measured savings are
+			// always derived when a measurement exists.
+			if (measured.savingsPerRequestTokens === null) {
+				lines.push(`${label}  measured: ${removed} removed · not priced`);
+				continue;
+			}
+			const accuracy = foldAccuracy(fold);
+			lines.push(
+				`${label}  measured ${removed} removed · ${fmt(measured.savingsPerRequestTokens)}/req over ${fold.measuredRequests} request${fold.measuredRequests === 1 ? "" : "s"}${accuracy === null ? "" : ` (${fmtPct(accuracy * 100)} of predicted)`}`,
+			);
+		}
+	}
 	if (!profile.piHelpers) {
 		lines.push("");
 		lines.push(
 			"note: Pi helpers were not resolvable, so token counts use the built-in port. Set PI_CODING_AGENT_PACKAGE to the Pi package path for exact parity.",
 		);
 	}
+	return lines.join("\n");
+}
+
+// ============================================================================
+// Fold scoring report (ticket 06)
+//
+// Compare every fold's ticket-04 predictions with what the recorded requests
+// actually measured, then aggregate across sessions into one decision: retire
+// the Online Context Compact gate or keep it. Strictly offline and read-only:
+// sessions are append-only, so measured economics live in this report only.
+// ============================================================================
+
+/** Measured savings must reach this share of predicted savings to retire the gate. */
+export const RETIRE_BAR = 0.9;
+
+/**
+ * Per-request savings ratio for one fold (measured ÷ predicted), or null when
+ * either side can't say: nothing measured, or a prediction of no savings to
+ * measure against. Shared by the single-session summary and the aggregate so
+ * the two views cannot drift apart.
+ */
+function foldAccuracy(fold: FoldProfile): number | null {
+	const predicted = fold.predicted?.savingsPerRequestTokens ?? 0;
+	const measured = fold.actual?.savingsPerRequestTokens ?? null;
+	if (measured === null || predicted <= 0) return null;
+	return measured / predicted;
+}
+
+/** One predicted fold's predicted-vs-measured row. */
+export interface FoldScore {
+	/** Session file basename, or "-" when analyzed without a file path. */
+	session: string;
+	recordId: string;
+	fromStep: number | null;
+	/** Requests over which the fold's summary rendered (the measurement window). */
+	requests: number;
+	/** predicted.savingsPerRequestTokens × requests; null when nothing was observed. */
+	predictedSavings: number | null;
+	/** measured savings per request × requests; null when never measured or unpriced. */
+	measuredSavings: number | null;
+	/** measured/predicted for this fold, null when either side is missing or predicted ≤ 0. */
+	accuracy: number | null;
+}
+
+/** The aggregate decision across recorded sessions. */
+export interface ScoreReport {
+	sessions: number;
+	/** Fold records carrying ticket-04 predictions. */
+	predictedFolds: number;
+	/** Predicted folds with a measurement attached. */
+	scoredFolds: number;
+	/** Predicted folds without a measurement (summary never rendered). */
+	unscoredFolds: number;
+	/** Scored folds whose predictions are positive — the basis of the ratio. */
+	comparedFolds: number;
+	/** Σ predicted savings × measured requests, over scored folds with positive predictions. */
+	predictedSavings: number;
+	/** Σ measured savings × measured requests, over the same folds. */
+	measuredSavings: number;
+	/** measuredSavings / predictedSavings, or null when nothing comparable exists. */
+	accuracy: number | null;
+	verdict: "retire" | "keep";
+	/** The evidence behind the verdict, ready to print after it. */
+	verdictReason: string;
+	folds: FoldScore[];
+}
+
+/**
+ * Aggregate per-fold predictions against measured savings.
+ *
+ * Each fold is weighted by the requests it was measured over, so the totals
+ * read as "what the advisory promised across these sessions vs what the
+ * sessions actually delivered". Folds that never rendered or predicted no
+ * savings stay out of the ratio; unscored and un-compared folds are counted
+ * separately so the totals line can say what it was computed over.
+ */
+export function scoreSessions(profiles: readonly Profile[]): ScoreReport {
+	const folds: FoldScore[] = [];
+	let predictedSavings = 0;
+	let measuredSavings = 0;
+	let scoredFolds = 0;
+	let comparedFolds = 0;
+
+	for (const profile of profiles) {
+		const session = profile.sessionFile ? basename(profile.sessionFile) : "-";
+		for (const fold of profile.folds) {
+			if (!fold.predicted) continue;
+			const requests = fold.measuredRequests;
+			const predictedTotal = fold.predicted.savingsPerRequestTokens * requests;
+			const measured = requests > 0 ? (fold.actual?.savingsPerRequestTokens ?? null) : null;
+			folds.push({
+				session,
+				recordId: fold.recordId,
+				fromStep: fold.fromStep ?? null,
+				requests,
+				predictedSavings: requests > 0 ? predictedTotal : null,
+				measuredSavings: measured === null ? null : measured * requests,
+				accuracy: foldAccuracy(fold),
+			});
+			if (measured === null) continue;
+			scoredFolds++;
+			// Predicted ≤ 0 (the advisory expected a cost fold) was measured, but
+			// it has no positive promise to hold against, so it never enters the
+			// ratio — counted in comparedFolds' denominator for honesty.
+			if (fold.predicted.savingsPerRequestTokens <= 0) continue;
+			comparedFolds++;
+			predictedSavings += predictedTotal;
+			measuredSavings += measured * requests;
+		}
+	}
+
+	const predictedFolds = folds.length;
+	const unscoredFolds = predictedFolds - scoredFolds;
+	const accuracy = predictedSavings > 0 ? measuredSavings / predictedSavings : null;
+	const bar = `${Math.round(RETIRE_BAR * 100)}%`;
+	let verdict: "retire" | "keep" = "keep";
+	let verdictReason: string;
+	if (predictedFolds === 0) {
+		verdictReason = "insufficient evidence: no recorded predictions";
+	} else if (scoredFolds === 0) {
+		verdictReason = "insufficient evidence: no predicted fold was measured";
+	} else if (accuracy === null) {
+		verdictReason = "insufficient evidence: no positive predicted savings to compare";
+	} else {
+		verdict = accuracy >= RETIRE_BAR ? "retire" : "keep";
+		verdictReason = `measured savings reached ${fmtPct(accuracy * 100)} of predicted (bar ${bar})`;
+	}
+
+	return {
+		sessions: profiles.length,
+		predictedFolds,
+		scoredFolds,
+		unscoredFolds,
+		comparedFolds,
+		predictedSavings,
+		measuredSavings,
+		accuracy,
+		verdict,
+		verdictReason,
+		folds,
+	};
+}
+
+/** Render the scoring report: per-fold rows, totals, and the gate verdict. */
+export function renderScore(report: ScoreReport): string {
+	const lines: string[] = [];
+	lines.push("");
+	lines.push(
+		`Fold scoring — ${report.sessions} session${report.sessions === 1 ? "" : "s"}, ${report.predictedFolds} predicted fold${report.predictedFolds === 1 ? "" : "s"}`,
+	);
+	lines.push("");
+	if (report.folds.length > 0) {
+		const headers = ["session", "fold", "step", "reqs", "predicted", "measured", "accuracy"];
+		const rows = report.folds.map((fold) => [
+			fold.session,
+			fold.recordId.length > 12 ? `${fold.recordId.slice(0, 11)}…` : fold.recordId,
+			fold.fromStep === null ? "-" : String(fold.fromStep),
+			String(fold.requests),
+			fold.predictedSavings === null ? "-" : fmt(fold.predictedSavings),
+			fold.measuredSavings === null ? "-" : fmt(fold.measuredSavings),
+			fold.accuracy === null ? "-" : fmtPct(fold.accuracy * 100),
+		]);
+		const widths = headers.map((header, column) =>
+			Math.max(header.length, ...rows.map((row) => row[column].length), 0),
+		);
+		const line = (cells: string[]): string =>
+			cells.map((cell, column) => (column < 3 ? cell.padEnd(widths[column]) : cell.padStart(widths[column]))).join("  ");
+		lines.push(line(headers));
+		lines.push(widths.map((width) => "-".repeat(width)).join("  "));
+		for (const row of rows) lines.push(line(row));
+		lines.push("");
+	}
+	lines.push(
+		`  totals (${report.comparedFolds} compared): predicted ${fmt(report.predictedSavings)} · measured ${fmt(report.measuredSavings)} · accuracy ${report.accuracy === null ? "-" : fmtPct(report.accuracy * 100)}`,
+	);
+	lines.push(
+		`  scored ${report.scoredFolds} of ${report.predictedFolds} predicted folds (${report.unscoredFolds} unscored)`,
+	);
+	lines.push(`  bar: measured ≥ ${Math.round(RETIRE_BAR * 100)}% of predicted`);
+	lines.push(`  verdict: ${report.verdict === "retire" ? "RETIRE" : "KEEP"} the OCC gate — ${report.verdictReason}`);
 	return lines.join("\n");
 }
 
@@ -1169,6 +1565,7 @@ function usage(): string {
 	return [
 		"Usage: node profile.ts <session> [--last N] [--json] [--csv]",
 		"       node profile.ts --list [query] [--all] [--deep] [--json]",
+		"       node profile.ts --score [session...] [--all] [--json]",
 		"",
 		"Profiles one Pi session: provider-reported prompt size and cache split",
 		"next to the reconstructed D-Mailed and raw context sizes.",
@@ -1188,9 +1585,16 @@ function usage(): string {
 		"",
 		"Listing sessions:",
 		"  --list     list sessions for the current working directory",
-		"  --all      with --list: every project under the sessions root",
+		"  --all      with --list/--score: every project under the sessions root",
 		"  --deep     with --list: also count requests, folds and prompt tokens",
 		"  query      with --list: substring filter on cwd, session id or file name",
+		"",
+		"Scoring folds (offline, read-only; never writes to session files):",
+		"  --score    compare every recorded fold's predicted savings (ticket 04)",
+		"             against what the sessions actually measured and print one",
+		"             retire/keep verdict for the OCC gate. Scores the recorded",
+		"             sessions of the current directory; pass session ids/paths",
+		"             (or a directory) to choose explicitly.",
 	].join("\n");
 }
 
@@ -1215,6 +1619,7 @@ async function main(): Promise<void> {
 	let last = 0;
 	let mode: "table" | "json" | "csv" = "table";
 	let list = false;
+	let score = false;
 	let all = false;
 	let deep = false;
 	const positional: string[] = [];
@@ -1225,6 +1630,7 @@ async function main(): Promise<void> {
 		else if (arg === "--csv") mode = "csv";
 		else if (arg === "--last") last = Number.parseInt(args[++i] ?? "", 10) || 0;
 		else if (arg === "--list") list = true;
+		else if (arg === "--score") score = true;
 		else if (arg === "--all") all = true;
 		else if (arg === "--deep") deep = true;
 		// A token with a slash or a .jsonl suffix is a path, even if it starts
@@ -1238,8 +1644,14 @@ async function main(): Promise<void> {
 		}
 	}
 
-	if (list) {
-		await printSessionList(positional, { all, deep, mode });
+	if (list || score) {
+		if (list && score) {
+			console.error("--list and --score cannot be combined.\n\n" + usage());
+			process.exitCode = 2;
+			return;
+		}
+		if (score) await printScoreReport(positional, { all, mode });
+		else await printSessionList(positional, { all, deep, mode });
 		return;
 	}
 
@@ -1302,6 +1714,86 @@ async function main(): Promise<void> {
 		console.log(renderTable(profile));
 	}
 	console.log(renderSummary(profile));
+}
+
+async function printScoreReport(
+	positional: readonly string[],
+	options: { all: boolean; mode: "table" | "json" | "csv" },
+): Promise<void> {
+	if (options.mode === "csv") {
+		console.error("--csv is not supported with --score; use --json or the report.");
+		process.exitCode = 2;
+		return;
+	}
+
+	// A positional that names a directory is a project filter, not a session selector.
+	let cwd = process.cwd();
+	const selectors: string[] = [];
+	for (const value of positional) {
+		try {
+			if (statSync(value).isDirectory()) {
+				cwd = resolve(value);
+				continue;
+			}
+		} catch {
+			/* not a path: treat it as a session selector */
+		}
+		selectors.push(value);
+	}
+
+	let files: string[];
+	if (selectors.length > 0) {
+		// Explicit session selectors: resolve each one the friendly way.
+		files = [];
+		for (const selector of selectors) {
+			const resolution = await resolveSessionPath(selector);
+			if (!resolution.ok) {
+				console.error(resolution.message);
+				if (resolution.candidates.length > 0) {
+					console.error("");
+					console.error(renderSessionList(resolution.candidates, false));
+				} else {
+					console.error('Run "node profile.ts --list --deep" (add a query to search every project) to find a session.');
+				}
+				process.exitCode = 2;
+				return;
+			}
+			if (resolution.note) console.error(resolution.note);
+			files.push(resolution.file);
+		}
+	} else {
+		// Every recorded session for this project (or all projects with --all).
+		const rows = await listSessions({ cwd, all: options.all, deep: false });
+		rows.sort((a, b) => b.modified.localeCompare(a.modified));
+		files = rows.map((row) => row.file);
+	}
+
+	if (files.length === 0) {
+		console.log(`No sessions under ${sessionDirForCwd(cwd)}. Try --all to search every project.`);
+		return;
+	}
+
+	// Read-only by construction: sessions are append-only, and the measured
+	// economics live in this report, never in the files we read.
+	const profiles: Profile[] = [];
+	for (const file of files) {
+		let content: string;
+		try {
+			content = readFileSync(file, "utf8");
+		} catch (error) {
+			console.error(`Cannot read ${file}: ${error instanceof Error ? error.message : String(error)}`);
+			process.exitCode = 1;
+			return;
+		}
+		profiles.push(await analyzeSession(content, file));
+	}
+
+	const report = scoreSessions(profiles);
+	if (options.mode === "json") {
+		console.log(JSON.stringify(report, null, 2));
+		return;
+	}
+	console.log(renderScore(report));
 }
 
 async function printSessionList(

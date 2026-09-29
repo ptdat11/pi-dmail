@@ -12,7 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { analyzeSession, listSessions, resolveSessionPath, sessionDirForCwd } from "../profile.ts";
+import { analyzeSession, listSessions, renderScore, renderSummary, resolveSessionPath, scoreSessions, sessionDirForCwd } from "../profile.ts";
 
 const BIG = "x".repeat(4000); // ~1000 estimated tokens at chars/4
 
@@ -21,6 +21,12 @@ interface BuildOptions {
 	withFold?: boolean;
 	/** Omit usage.cost to exercise the "provider reported no cost" path. */
 	withCost?: boolean;
+	/** Uncached input tokens reported at the fold-start request (default 100). */
+	foldStartInput?: number;
+	/** Ticket-04 predicted economics recorded on the fold record. */
+	predicted?: Record<string, unknown>;
+	/** Place the fold record after the last request: declared but never applied. */
+	foldAtEnd?: boolean;
 }
 
 /** Fixed provider rates ($/M tokens) so a session's implied rates are checkable by hand. */
@@ -93,24 +99,133 @@ function buildSession(options: BuildOptions = {}): string {
 		}),
 		assistant("a2", "t1", "2026-01-01T00:00:04.000Z", 100, 1000, withCost),
 	];
-	if (options.withFold) {
-		lines.push(
-			entry("f1", "a2", "2026-01-01T00:00:05.000Z", {
-				type: "custom",
-				customType: "dmail.fold",
-				data: { fromEntryId: "a1", toEntryId: "a2", summary: "folded step one", fromStep: 1 },
-			}),
-		);
-	}
+	const foldRecord = () =>
+		entry("f1", options.foldAtEnd ? "a3" : "a2", options.foldAtEnd ? "2026-01-01T00:00:08.000Z" : "2026-01-01T00:00:05.000Z", {
+			type: "custom",
+			customType: "dmail.fold",
+			data: {
+				fromEntryId: "a1",
+				toEntryId: "a2",
+				summary: "folded step one",
+				fromStep: 1,
+				...(options.predicted ? { predicted: options.predicted } : {}),
+			},
+		});
+	const foldsEarly = options.withFold && !options.foldAtEnd;
+	if (foldsEarly) lines.push(foldRecord());
 	lines.push(
-		entry("u2", options.withFold ? "f1" : "a2", "2026-01-01T00:00:06.000Z", {
+		entry("u2", foldsEarly ? "f1" : "a2", "2026-01-01T00:00:06.000Z", {
 			type: "message",
 			message: { role: "user", content: BIG, timestamp: Date.parse("2026-01-01T00:00:06.000Z") },
 		}),
-		assistant("a3", "u2", "2026-01-01T00:00:07.000Z", 100, 2000, withCost),
+		assistant("a3", "u2", "2026-01-01T00:00:07.000Z", options.foldStartInput ?? 100, 2000, withCost),
 	);
+	if (options.withFold && options.foldAtEnd) lines.push(foldRecord());
 	return `${lines.join("\n")}\n`;
 }
+
+// --- Ticket 06: fold scoring -------------------------------------------------
+// A fold carrying ticket-04 predictions must come back with a measured
+// counter-side computed from the recorded requests: the leave-one-out marginal
+// (rebuild the request without this fold) valued at the prediction's own cache
+// ratio, so predicted and measured are priced like-for-like. Read-only:
+// nothing here writes back.
+
+const PREDICTED = { removedTokens: 2000, savingsPerRequestTokens: 20, rebuildTokens: 80, breakEvenRequests: 4 };
+
+test("fold scoring: predicted carried through, actual measured from usage", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true, predicted: PREDICTED }));
+	const fold = profile.folds[0];
+
+	assert.deepEqual(fold.predicted, PREDICTED);
+	// The fold renders for exactly one request (the final one).
+	assert.equal(fold.measuredRequests, 1);
+	assert.ok(fold.actual, "measured actual expected for an applied fold");
+	// Marginal ≈ archive (2000) − summary (~9) ≈ 1991; bounded because the real
+	// pi estimator may differ from the local chars/4 port.
+	assert.ok(
+		(fold.actual?.removedTokens ?? 0) >= 1700 && (fold.actual?.removedTokens ?? 0) <= 2200,
+		`removedTokens ${fold.actual?.removedTokens} outside 1700–2200`,
+	);
+	// savings = removed × cacheRatio, with the ratio inverted from the recorded
+	// prediction itself (20/2000 = 0.01) — never from the session's live prices.
+	assert.ok(
+		Math.abs((fold.actual?.savingsPerRequestTokens ?? -1) - (fold.actual?.removedTokens ?? 0) * 0.01) <= 0.5,
+		"savings must be removedTokens × the prediction's cache ratio",
+	);
+	assert.equal(fold.actual?.measuredAt, "2026-01-01T00:00:07.000Z");
+});
+
+test("fold scoring: a fold without a recorded prediction is not measured", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true }));
+	const fold = profile.folds[0];
+	assert.equal(fold.predicted, null);
+	assert.equal(fold.actual, null);
+	assert.equal(fold.measuredRequests, 0);
+});
+
+test("fold scoring: without usage cost the fold still scores identically", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true, withCost: false, predicted: PREDICTED }));
+	assert.equal(profile.cost, null);
+	const fold = profile.folds[0];
+	assert.ok(fold.actual, "removal is estimator-based and measurable without cost");
+	assert.ok((fold.actual?.removedTokens ?? 0) >= 1700, `removedTokens ${fold.actual?.removedTokens}`);
+	// Pricing comes from the prediction's own cache ratio, not from usage
+	// rates — a session without usage.cost scores exactly like one with it.
+	assert.ok(
+		Math.abs((fold.actual?.savingsPerRequestTokens ?? -1) - (fold.actual?.removedTokens ?? 0) * 0.01) <= 0.5,
+		"savings priced from the prediction basis without any cost rates",
+	);
+	assert.equal(fold.measuredRequests, 1);
+});
+
+test("fold scoring: a fold that never took effect has no measurement", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true, foldAtEnd: true, predicted: PREDICTED }));
+	const fold = profile.folds[0];
+	assert.deepEqual(fold.predicted, PREDICTED);
+	assert.equal(fold.effectiveAtRequest, null);
+	assert.equal(fold.actual, null);
+	assert.equal(fold.measuredRequests, 0);
+});
+
+test("aggregate score answers retire vs keep from recorded sessions", async () => {
+	// Measured ≈ 20/req matches the recorded prediction exactly → retire.
+	const retire = scoreSessions([
+		await analyzeSession(buildSession({ withFold: true, predicted: PREDICTED }), "retire.jsonl"),
+	]);
+	assert.equal(retire.sessions, 1);
+	assert.equal(retire.scoredFolds, 1);
+	assert.equal(retire.comparedFolds, 1);
+	assert.equal(retire.verdict, "retire");
+	assert.match(renderScore(retire), /RETIRE the OCC gate/);
+	assert.match(renderScore(retire), /retire\.jsonl/);
+
+	// A prediction claiming 10× the removal lands at 10% accuracy → keep.
+	// Pricing is inverted from the prediction itself (200/20000 = 0.01, the
+	// same basis as the honest one), so only the removal claim differs.
+	const keep = scoreSessions([
+		await analyzeSession(
+			buildSession({ withFold: true, predicted: { ...PREDICTED, removedTokens: 20_000, savingsPerRequestTokens: 200 } }),
+			"keep.jsonl",
+		),
+	]);
+	assert.equal(keep.verdict, "keep");
+	assert.ok(Math.abs((keep.accuracy ?? 0) - 0.1) < 0.01, `accuracy ${keep.accuracy}`);
+	assert.match(renderScore(keep), /KEEP the OCC gate/);
+});
+
+test("single-session summary prints the fold scoring section", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true, predicted: PREDICTED }), "s.jsonl");
+	const summary = renderSummary(profile);
+	assert.match(summary, /Fold scoring/);
+	assert.match(summary, /predicted [\d,]+ removed · 20\/req/);
+	assert.match(summary, /measured [\d,]+ removed · 20\/req over 1 request/);
+	assert.match(summary, /\(100\.0% of predicted\)/);
+
+	// Sessions without predictions never show the section.
+	const plain = renderSummary(await analyzeSession(buildSession({ withFold: true })));
+	assert.doesNotMatch(plain, /Fold scoring/);
+});
 
 test("session without folds: folding only costs the step markers", async () => {
 	const profile = await analyzeSession(buildSession({ withFold: false }));
@@ -133,6 +248,9 @@ test("session without folds: folding only costs the step markers", async () => {
 	const second = profile.requests[1];
 	assert.ok((second.savedCostLow ?? 0) <= (second.savedCostHigh ?? 0));
 	assert.ok((second.savedCostHigh ?? 0) < 0);
+
+	// No folds means no fold economics to report.
+	assert.equal(profile.economics, null);
 });
 
 test("an applied fold shows up as a real saving at the next request", async () => {
@@ -169,6 +287,36 @@ test("an applied fold shows up as a real saving at the next request", async () =
 	assert.equal(third.input, 100);
 	assert.equal(third.cacheRead, 2000);
 	assert.equal(third.actualPrompt, 2100);
+
+	// Fold economics: one fold, one fold-start, baseline input = median of the
+	// two non-fold-start requests (100), so this fold costs nothing above it.
+	const e = profile.economics;
+	assert.ok(e, "an applied fold must produce economics");
+	assert.equal(e.foldStarts, 1);
+	assert.equal(e.foldsApplied, 1);
+	assert.equal(e.foldsPerStart, 1);
+	assert.equal(e.baselineInput, 100);
+	assert.equal(e.excessInput, 0);
+	assert.equal(e.excessCost, 0);
+	assert.equal(e.breakEvenRequests, 0);
+	assert.ok(e.meanSaved !== null && e.meanSaved > 1000);
+});
+
+test("fold economics price a fold-start that paid above baseline", async () => {
+	const profile = await analyzeSession(buildSession({ withFold: true, foldStartInput: 800 }));
+	const e = profile.economics;
+	assert.ok(e);
+
+	// Baseline is still the median of the non-fold-start requests (100, 100);
+	// the fold-start charged 800, so the re-prefill cost 700 tokens above it.
+	assert.equal(e.baselineInput, 100);
+	assert.equal(e.excessInput, 700);
+	assert.ok(Math.abs((e.excessCost ?? 0) - (700 * RATES.input) / 1e6) < 1e-12);
+
+	// The session saves >1000 tokens/request with the fold active, so the
+	// re-prefill is repaid well within a single request.
+	assert.ok(e.meanSaved !== null && e.meanSaved > 1000);
+	assert.ok(e.breakEvenRequests !== null && e.breakEvenRequests > 0 && e.breakEvenRequests < 1);
 });
 
 test("json report is serializable and carries the totals", async () => {
@@ -179,6 +327,8 @@ test("json report is serializable and carries the totals", async () => {
 	assert.equal(roundTripped.totals.requests, 3);
 	assert.ok(roundTripped.totals.saved > 0);
 	assert.equal(roundTripped.totals.foldsApplied, 1);
+	assert.ok(roundTripped.economics, "economics must survive JSON round-trip");
+	assert.equal(roundTripped.economics.foldStarts, 1);
 });
 
 test("usage.cost becomes marginal rates and a saved-dollar range", async () => {

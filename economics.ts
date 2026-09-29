@@ -85,6 +85,31 @@ export interface ActualEconomics {
 	savingsPerRequestTokens: number | null;
 }
 
+/**
+ * The cache ratio a recorded prediction was priced with — the inverse of the
+ * model's `savings = removed × cacheRatio`. Scoring prices the measured side
+ * with exactly this ratio (falling back to DEFAULT_CACHE_RATIO when the
+ * prediction cannot yield one), so predicted and actual are compared
+ * like-for-like: a session's real cache prices can never flip a verdict,
+ * only prediction quality can (ticket 06).
+ */
+export function cacheRatioOf(
+	predicted: Pick<PredictedEconomics, "removedTokens" | "savingsPerRequestTokens">,
+): number {
+	const { removedTokens, savingsPerRequestTokens } = predicted;
+	if (
+		typeof removedTokens === "number" &&
+		Number.isFinite(removedTokens) &&
+		removedTokens !== 0 &&
+		typeof savingsPerRequestTokens === "number" &&
+		Number.isFinite(savingsPerRequestTokens)
+	) {
+		const ratio = savingsPerRequestTokens / removedTokens;
+		if (Number.isFinite(ratio) && ratio > 0) return ratio;
+	}
+	return DEFAULT_CACHE_RATIO;
+}
+
 export interface Economics {
 	verdict: FoldVerdict;
 	/** Signed: positive = tokens removed from the steady-state context. */
