@@ -40,7 +40,7 @@
  * (`--proj--/<file>.jsonl`), or any unambiguous fragment of the session id.
  */
 import { execSync } from "node:child_process";
-import { closeSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { closeSync, type Dirent, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -61,7 +61,14 @@ import { FOLD_TYPE, foldContext, numberSteps, type FoldRecord } from "./fold.ts"
 // context gauge; the ports keep the tool runnable with nothing installed.
 // ============================================================================
 
-type AnyEntry = Record<string, any>;
+/**
+ * One parsed session entry: loose on every field but `id`, the key the fold
+ * seam joins by (`foldContext`, `numberSteps`, `readFolds`' `recordId`) and that
+ * Pi writes on every entry via `SessionEntryBase`. Raw JSON is still guarded at
+ * the joins (`typeof entry.id === "string"`) — the header line has no id — so
+ * pinning it here types the seam without pretending the parse is validated.
+ */
+type AnyEntry = Record<string, any> & { id: string };
 type AnyMessage = Record<string, any>;
 
 interface PiApi {
@@ -331,6 +338,11 @@ function buildMessageLists(
 	});
 	const raw = foldContext<AnyEntry, AnyMessage>(requestEntries, [], {
 		convert: toMessages,
+		// Required by the seam's options but unreachable on this path: `folds` is
+		// empty, so `summaryMessage` is never invoked (no record → no summary is
+		// ever injected). It therefore does no `renderedFoldIds` bookkeeping — the
+		// raw view must leave that untouched.
+		summaryMessage: (text) => userMessage(text, Date.now()),
 	});
 
 	return {
@@ -558,7 +570,10 @@ export async function listSessions(options: ListOptions = {}): Promise<SessionSu
 
 	let dirs: string[];
 	if (options.all) {
-		let entries: ReturnType<typeof readdirSync>;
+		// Annotated, not `ReturnType<typeof readdirSync>`: that resolves to the
+		// buffer-encoding overload, typing `entry.name` as NonSharedBuffer when
+		// this call (no `encoding`) actually returns Dirent<string>.
+		let entries: Dirent<string>[];
 		try {
 			entries = readdirSync(root, { withFileTypes: true });
 		} catch {
@@ -757,12 +772,17 @@ export interface Profile {
 	economics: FoldEconomics | null;
 }
 
-function mean(values: number[]): number | null {
+// Both take `readonly number[]`: neither mutates its input (median sorts its
+// own copy), so a caller's readonly array can be passed as-is. Widening the
+// parameter — rather than copying at the call site — keeps ownership where the
+// caller put it: a defensive copy would hand these functions a different array
+// than the one the caller passed, changing mutation semantics for no gain.
+function mean(values: readonly number[]): number | null {
 	if (values.length === 0) return null;
 	return values.reduce((sum, value) => sum + value, 0) / values.length;
 }
 
-function median(values: number[]): number | null {
+function median(values: readonly number[]): number | null {
 	if (values.length === 0) return null;
 	const sorted = [...values].sort((a, b) => a - b);
 	const middle = Math.floor(sorted.length / 2);
@@ -1340,7 +1360,16 @@ export interface ScoreReport {
  * savings stay out of the ratio; unscored and un-compared folds are counted
  * separately so the totals line can say what it was computed over.
  */
-export function scoreSessions(profiles: readonly Profile[]): ScoreReport {
+/**
+ * The slice of a profile scoring reads: which session it was, and the folds it
+ * produced. `scoreSessions` is aggregation-only — it never touches `requests`,
+ * `totals`, `cost` or `economics` — so narrowing the parameter documents that
+ * and lets a minimal fixture stand in for a full `Profile` (`Profile` satisfies
+ * this; only the accepted input narrowed, so every existing caller still typechecks).
+ */
+export type ScoreInput = Pick<Profile, "sessionFile" | "folds">;
+
+export function scoreSessions(profiles: readonly ScoreInput[]): ScoreReport {
 	const folds: FoldScore[] = [];
 	let predictedSavings = 0;
 	let measuredSavings = 0;

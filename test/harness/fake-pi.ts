@@ -12,7 +12,12 @@ export interface RegisteredTool {
 	promptSnippet?: string;
 	parameters: unknown;
 	execute: (...args: any[]) => Promise<any>;
-	renderResult?: (...args: any[]) => unknown;
+	/**
+	 * Rendering contract only: pi-tui's `Component` is not re-exported by the
+	 * package root, so this names just the method the harness calls —
+	 * `render(width) -> lines` (pi-tui `Component.render`).
+	 */
+	renderResult?: (...args: any[]) => RenderedComponent;
 }
 
 export interface RegisteredCommand {
@@ -25,7 +30,19 @@ export interface RegisteredFlag {
 	options: { description?: string; type: "boolean" | "string"; default?: boolean | string };
 }
 
-export type HookHandler = (event: any, ctx?: any) => unknown | Promise<unknown>;
+/** What harness rendering calls on a tool result; see `RegisteredTool.renderResult`. */
+export interface RenderedComponent {
+	render(width: number): string[];
+}
+
+/**
+ * A hook handler as the dispatcher sees it. Pi calls hooks as `(event, ctx)`,
+ * but `dispatchHook` forwards whatever array the caller passed, so the handler
+ * must take rest args — a fixed-arity signature cannot be spread from an
+ * `unknown[]` (TS2556). Rest args still accept the same `(event, ctx)` handlers;
+ * `unknown[]` (not `any[]`) keeps the forwarded values untyped-but-checked.
+ */
+export type HookHandler = (...args: unknown[]) => unknown | Promise<unknown>;
 
 export interface FakePi {
 	/** The object handed to the extension's default export. */

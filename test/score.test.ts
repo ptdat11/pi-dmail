@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { DEFAULT_CACHE_RATIO, cacheRatioOf } from "../economics.ts";
-import { RETIRE_BAR, renderScore, scoreSessions, type FoldProfile, type Profile } from "../profile.ts";
+import { RETIRE_BAR, renderScore, scoreSessions, type FoldProfile, type ScoreInput } from "../profile.ts";
 
 function predicted(savingsPerRequestTokens: number) {
 	return { removedTokens: savingsPerRequestTokens, savingsPerRequestTokens, rebuildTokens: null, breakEvenRequests: null };
@@ -20,11 +20,15 @@ function actual(savingsPerRequestTokens: number) {
 	return { measuredAt: "2026-01-01T00:00:07.000Z", removedTokens: savingsPerRequestTokens, savingsPerRequestTokens };
 }
 
-/** Minimal Profile for aggregation: scoreSessions only reads sessionFile + folds. */
-function fakeProfile(sessionFile: string, folds: Array<Partial<FoldProfile>>): Profile {
+/**
+ * Minimal profile for aggregation: `scoreSessions` reads only sessionFile +
+ * folds (`ScoreInput`), so the fixture carries exactly those. The omitted
+ * fields were never read, so dropping `requests: []` cannot change what any
+ * assertion observes.
+ */
+function fakeProfile(sessionFile: string, folds: Array<Partial<FoldProfile>>): ScoreInput {
 	return {
 		sessionFile,
-		requests: [],
 		folds: folds.map(
 			(fold): FoldProfile => ({
 				recordId: "f1",
@@ -39,7 +43,7 @@ function fakeProfile(sessionFile: string, folds: Array<Partial<FoldProfile>>): P
 				...fold,
 			}),
 		),
-	} as Profile;
+	};
 }
 
 test("score: measured savings at the 90% bar retire the gate", () => {

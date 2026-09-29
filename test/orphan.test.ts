@@ -10,6 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import type { CustomEntry } from "@earendil-works/pi-coding-agent";
 import { assertFoldDetails, createHarness, SessionFixture, threeStepSession } from "./harness/index.ts";
 import { FOLD_TYPE } from "../fold.ts";
 
@@ -88,7 +89,11 @@ test("a pre-boundary fold record is skipped by replay, counted, and the count is
 	assert.deepEqual(await contextMessages(h), messages, "a second replay yields identical output");
 
 	// Nothing was modified or removed: the orphan record is still on disk, byte-identical.
-	const orphan = fixture.entries.find((entry) => entry.type === "custom" && entry.customType === FOLD_TYPE);
+	// find() narrows only with an explicit predicate: `CustomEntry` is the union
+	// member that carries `data`.
+	const orphan = fixture.entries.find(
+		(entry): entry is CustomEntry => entry.type === "custom" && entry.customType === FOLD_TYPE,
+	);
 	assert.deepEqual(orphan?.data, {
 		fromEntryId: "e2",
 		toEntryId: "e6",
