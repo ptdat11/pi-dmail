@@ -43,13 +43,14 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-	type AgentMessage,
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	type ExtensionContext,
 	getAgentDir,
+	getLatestCompactionEntry,
 	keyHint,
 	type SessionEntry,
+	type SessionMessageEntry,
 	estimateTokens,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
@@ -79,6 +80,15 @@ import {
 } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 import { buildFoldPickerRows, estimateLine, type FoldPickerRow } from "./picker.ts";
+
+/**
+ * The message shape pi records entries with. pi used to export `AgentMessage`
+ * from its package root and no longer does (0.87.x), so derive it from the
+ * exported `SessionMessageEntry` pi itself declares entries with — if pi
+ * changes the message type, typecheck fails here instead of the seam drifting
+ * silently against the type pi actually writes.
+ */
+type AgentMessage = SessionMessageEntry["message"];
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const POLICY_PATH = process.env.DMAIL_POLICY ?? join(HERE, "POLICY.md");
@@ -237,12 +247,42 @@ function readFolds(entries: readonly SessionEntry[]): LocatedFold[] {
 
 /**
  * Plan a replay for the current view: era split first, then validation — so the
- * count is exactly what replay would skip. Both call sites (context hook and
- * tool result) go through here; if they planned separately, the tool could
- * report a number the hook does not agree with.
+ * count is exactly what replay would skip. Every site that plans a replay (tool
+ * results, the context hook, the compaction seam) goes through here; if they
+ * planned separately, one could report a number the others do not agree with.
  */
 function planForView(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): ReplayPlan {
 	return planReplay(entries, readFolds(branch), { isStepStart: isAssistantEntry });
+}
+
+/**
+ * One line prefixed to the spliced guidance channel: fold summaries are a lossy
+ * editorial layer — they omit details on purpose — while the raw messages pi
+ * summarizes are the material of record, so the summarizer trusts the narrative
+ * for shape and goes back to the raw text for facts.
+ */
+const FOLD_CHANNEL_INSTRUCTION = "Fold summaries may omit details; the raw messages below are authoritative.";
+
+/**
+ * The current compaction era: branch entries from the latest compaction boundary
+ * to the end — the material pi's compaction is about to summarize.
+ *
+ * The boundary is the latest compaction entry's `firstKeptEntryId` (pi's own
+ * `getLatestCompactionEntry` finds it), which is the same membership
+ * `buildContextEntries` keeps in the context view, so a record held before the
+ * boundary is out-of-era here exactly when it is out of view for replay. No
+ * compaction yet means the whole branch is the era.
+ */
+function currentEraOf(branch: readonly SessionEntry[]): SessionEntry[] {
+	const compaction = getLatestCompactionEntry([...branch]);
+	if (!compaction) return [...branch];
+	const kept = branch.findIndex((entry) => entry.id === compaction.firstKeptEntryId);
+	if (kept >= 0) return [...branch.slice(kept)];
+	// Stale boundary (the kept entry left the branch): fall back to what pi's own
+	// projection would keep — entries after the compaction record — so nothing
+	// from before the boundary can leak into the era.
+	const at = branch.findIndex((entry) => entry.id === compaction.id);
+	return at < 0 ? [] : [...branch.slice(at + 1)];
 }
 
 /**
@@ -718,6 +758,69 @@ export default function dmail(pi: ExtensionAPI): void {
 			return { messages: result.messages };
 		} catch {
 			// A context hook must never break a request: fall through to Pi's view.
+			return undefined;
+		}
+	});
+
+	/**
+	 * The hybrid compaction seam (ticket 08): folding's editorial work survives
+	 * pi's compaction.
+	 *
+	 * Compaction summarizes the current era — the branch since the latest
+	 * compaction entry — and that era's folds are exactly the material the agent
+	 * already decided it was finished with. Left alone, pi's summarizer would see
+	 * only the raw messages, and the post-compaction session would be re-taught
+	 * material the agent had folded away.
+	 *
+	 * So this handler splices the era's fold summaries into the one channel pi's
+	 * default summarizer already reads for iteration — `preparation.previousSummary`,
+	 * in place: the one-line instruction first, then pi's own prior summary (when
+	 * there is one), then S1…Sn in chronological order. `messagesToSummarize`,
+	 * `tokensBefore`, and `fileOps` stay exactly as pi prepared them, and the
+	 * handler returns nothing, so pi's default summarizer runs as it always would
+	 * — hybrid, not replacement.
+	 */
+	pi.on("session_before_compact", async (event, ctx) => {
+		// Disabled is a decision, not a failure: guarded before the try, so the
+		// channel is never touched when folding is off.
+		if (!enabled) return undefined;
+		try {
+			const branch = event.branchEntries;
+			const era = currentEraOf(branch);
+
+			// Plan through the shared planner — era split (holder-based) then
+			// validation — so the summaries spliced here are exactly what the context
+			// hook replays: re-fold suppression and endpoint validation included,
+			// records listed but never double-counted.
+			const plan = planForView(era, branch);
+			const replay = foldContext<SessionEntry, string>(era, plan.inEra, {
+				convert: () => [],
+				summaryMessage: (_wrappedText, fold) => fold.summary,
+				isStepStart: isAssistantEntry,
+			});
+			if (replay.messages.length === 0) return undefined;
+
+			const prior = event.preparation.previousSummary;
+			// Chronological: pi's prior summary first (created from the fold summaries
+			// alone when the channel does not exist yet), then the era's chain.
+			const channel = [
+				FOLD_CHANNEL_INSTRUCTION,
+				...(typeof prior === "string" && prior.trim() !== "" ? [prior] : []),
+				...replay.messages,
+			].join("\n\n");
+			// In place: pi's default summarizer reads this same preparation object
+			// after the handlers run. Raw material, token estimates, and file-op
+			// bookkeeping stay as pi prepared them; the return value stays empty so
+			// pi's summarizer still runs.
+			event.preparation.previousSummary = channel;
+			return undefined;
+		} catch (error) {
+			// Compaction must never break because of this hook — but a silent no-op
+			// would hide a seam failure, so surface it; pi proceeds untouched either way.
+			ctx.ui.notify(
+				`dmail: compaction seam failed — ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
 			return undefined;
 		}
 	});

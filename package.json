@@ -32,6 +32,7 @@
   },
   "scripts": {
     "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "npx --yes -p typescript tsc -p tsconfig.typecheck.json",
     "profile": "node profile.ts"
   }
 }
