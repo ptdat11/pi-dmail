@@ -1,13 +1,13 @@
 /**
- * The injected policy is the extension's only instruction channel (ticket 10):
- * an enabled session must gain the fold-timing and ladder guidance — free-form
- * timing, large-and-rare over small-and-frequent, re-folding stale ladders,
- * preview/price before committing, and the user's picker — while a disabled
+ * The injected policy is the extension's only instruction channel (tickets 10 +
+ * follow-up): an enabled session must gain the fold-timing and ladder guidance —
+ * free-form timing, large-and-rare over small-and-frequent, fold when a task
+ * completes so past folds stay valid, preview before committing — while a disabled
  * session must see no D-Mail guidance at all (instructing the model to fold on
  * a request that will not be folded is the one thing guaranteed to confuse it).
- * The guidance rides the existing policy, so it inherits and must not
- * contradict the non-destructive framing: folding changes what is shown, never
- * what happened.
+ * The policy teaches only how to send D-Mail: no user commands, no picker. It
+ * rides the existing policy, so it inherits and must not contradict the
+ * non-destructive framing: folding changes what is shown, never what happened.
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -27,17 +27,19 @@ test("an enabled session's system prompt carries the ladder guidance", async () 
 
 	assert.ok(result.systemPrompt.startsWith("BASE PROMPT"), "the existing prompt survives, policy appended");
 	assert.match(result.systemPrompt, /# REQUIRE: Folding your context/, "the policy is injected");
-	// The five pieces of ticket 10's guidance, anchored to the section's own
-	// phrasing so a future edit that drops the guidance cannot pass vacuously.
+	// The guidance pieces, anchored to the section's own phrasing so a future
+	// edit that drops the guidance cannot pass vacuously.
 	assert.match(result.systemPrompt, /Fold timing is \*\*free-form\*\*/, "fold timing is free-form");
 	assert.match(result.systemPrompt, /Each fold sits on a \*\*ladder\*\*/, "the ladder model is named");
 	assert.match(result.systemPrompt, /\*\*Fold large and rare rather than small\s+and frequent\./,
 		"large-and-rare rather than small-and-frequent");
-	assert.match(result.systemPrompt, /\*\*Re-fold stale ladders\.\*\*/, "stale ladders get re-folded");
-	assert.match(result.systemPrompt, /\*\*Preview before you commit\.\*\*.*\/dmail price \[step\]/s,
-		"preview/price before committing");
-	assert.match(result.systemPrompt, /The user can pin the cut point.*`\/dmail fold` picker/s,
-		"the user can pin a cut point via the picker");
+	assert.match(result.systemPrompt, /\*\*Fold when a task completes\..*closed a task\nthat is still closed/s,
+		"fold at task completion, so past folds stay valid");
+	assert.match(result.systemPrompt, /\*\*Preview before you commit\.\*\*.*`preview` parameter/s,
+		"preview before committing");
+	// The policy teaches how to send D-Mail only — no user-facing commands.
+	assert.doesNotMatch(result.systemPrompt, /\/(dmail|send-dmail)\b/,
+		"no user commands leak into the policy");
 	// Non-destructive framing stays intact alongside the new guidance.
 	assert.match(result.systemPrompt, /not what happened/, "the non-destructive framing is preserved");
 });

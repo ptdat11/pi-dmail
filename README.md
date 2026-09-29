@@ -8,7 +8,7 @@ the session as stored](docs/visuallization.gif)
 
 *Both panes are the same conversation. On the left, a fold collapses a finished range into one summary
 chip, so the sent context stays lean. On the right, the stored transcript keeps every step and never
-shrinks — which is why folding too much costs a re-read, not data.*
+shrinks.*
 
 ## The problem
 
