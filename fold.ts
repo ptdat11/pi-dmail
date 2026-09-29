@@ -1,9 +1,9 @@
 /**
  * The fold algebra for D-Mail.
  *
- * This module is the extension's one test seam. It is pure: no Pi runtime, no
- * I/O, no model, no clock, no globals. Everything above it in `index.ts` is
- * declarative wiring around the Pi extension API.
+ * This module is pure: no Pi runtime, no I/O, no model, no clock, no globals.
+ * Everything above it in `index.ts` is declarative wiring around the Pi
+ * extension API. `test/fold.test.ts` unit-tests the algebra here.
  *
  * The unit of work is a *fold record*: a promise that a range of finished steps
  * has been replaced by a summary. Records are produced by the model (via the
@@ -72,8 +72,10 @@ export interface FoldOptions<E, M> {
 	/** Build the injected summary message. Receives already-wrapped text. */
 	summaryMessage: (wrappedText: string, fold: FoldRecord) => M;
 	/**
-	 * Optional message to emit immediately before a kept entry. Used for step
-	 * markers. Never called for a dropped entry.
+	 * Optional message to emit immediately before a kept entry, and before an
+	 * injected summary at the fold's start (which is how a summary inherits the
+	 * marker of the step it replaces). Used for step markers. Never called for
+	 * any other dropped entry.
 	 */
 	beforeEntry?: (entry: E, index: number) => M | undefined;
 	/**
@@ -124,10 +126,13 @@ export function numberSteps<E extends EntryLike>(
 /**
  * Replay fold records over a list of entries.
  *
- * Overlapping records are allowed. Their drop ranges union, and each record
- * still contributes its own summary at its own start position, so an overlap can
- * produce two adjacent summaries. That is noise, not corruption, and collapsing
- * it is deliberately left out of the first slice.
+ * Overlapping records are allowed; their drop ranges union. Summaries resolve by
+ * containment: a newer record whose range contains an older record's start
+ * replaces that summary — so a re-fold that reaches back to an earlier fold's
+ * start renders one summary where two would collide, a same-start re-fold means
+ * newest wins, and an overlap that stops short of the older start leaves both
+ * summaries in place. Suppression compares records that validated only: a
+ * skipped record neither suppresses nor is suppressed.
  */
 export function foldContext<E extends EntryLike, M>(
 	entries: readonly E[],
@@ -172,6 +177,12 @@ export function foldContext<E extends EntryLike, M>(
 			skipped.push({ fold, why: "end-not-a-step-boundary" });
 			continue;
 		}
+		// Suppression by containment: this record's range swallows every summary
+		// whose start it contains (its own included, so same-start is newest-wins).
+		// Delete before set, or `from` would delete the entry just written.
+		for (const key of [...summaryAt.keys()]) {
+			if (from <= key && key < to) summaryAt.delete(key);
+		}
 		summaryAt.set(from, { text: wrapSummary(fold.summary), fold });
 		for (let i = from; i < to; i++) dropped.add(i);
 		applied.push(fold);
@@ -180,18 +191,27 @@ export function foldContext<E extends EntryLike, M>(
 	const messages: M[] = [];
 	let markers = 0;
 
+	const emitMarker = (entry: E, index: number): void => {
+		if (!options.beforeEntry) return;
+		const marker = options.beforeEntry(entry, index);
+		if (marker !== undefined) {
+			messages.push(marker);
+			markers++;
+		}
+	};
+
 	entries.forEach((entry, index) => {
 		const summary = summaryAt.get(index);
-		if (summary !== undefined) messages.push(options.summaryMessage(summary.text, summary.fold));
+		if (summary !== undefined) {
+			// A summary sits exactly at its fold's original first step, so it gets
+			// that step's marker: readers see the number the fold started from,
+			// and numbers never renumber as folds stack.
+			emitMarker(entry, index);
+			messages.push(options.summaryMessage(summary.text, summary.fold));
+		}
 		if (dropped.has(index)) return;
 
-		if (options.beforeEntry) {
-			const marker = options.beforeEntry(entry, index);
-			if (marker !== undefined) {
-				messages.push(marker);
-				markers++;
-			}
-		}
+		emitMarker(entry, index);
 		for (const message of options.convert(entry)) messages.push(message);
 	});
 

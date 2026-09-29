@@ -34,8 +34,8 @@
  *   results — that is a hard provider error, and `fold.ts` refuses any range that
  *   would cause it.
  *
- * The algebra lives in `fold.ts`, which is pure and is the only thing unit-tested.
- * This file is wiring.
+ * The algebra lives in `fold.ts`, which is pure and carries its own unit tests;
+ * `test/` drives this file through a fake Pi. This file is wiring.
  */
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
