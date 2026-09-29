@@ -10,7 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHarness, SessionFixture, threeStepSession } from "./harness/index.ts";
+import { assertFoldDetails, createHarness, SessionFixture, threeStepSession } from "./harness/index.ts";
 import { FOLD_TYPE } from "../fold.ts";
 
 /** Plain text of one context message, whatever shape pi's message uses. */
@@ -64,7 +64,7 @@ test("a pre-boundary fold record is skipped by replay, counted, and the count is
 
 	// The tool still works for the visible steps, and reports the orphan.
 	const result = await h.execute({ fromStep: 4, summary: "step 4 only" });
-	assert.deepEqual(result.details, {
+	assertFoldDetails(result, {
 		fromStep: 4,
 		throughStep: 4,
 		fromEntryId: "e9",

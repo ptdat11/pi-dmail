@@ -48,6 +48,7 @@ import {
 	getAgentDir,
 	keyHint,
 	type SessionEntry,
+	estimateTokens,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -57,12 +58,14 @@ import {
 	foldContext,
 	numberSteps,
 	planReplay,
+	wrapSummary,
 	type FoldRecord,
 	type LocatedFold,
 	type NumberedStep,
 	type ReplayPlan,
 } from "./fold.ts";
-import { type FoldRenderDetails, foldResultText, foldSkippedLine } from "./render.ts";
+import { evaluateEconomics } from "./economics.ts";
+import { type FoldRenderDetails, foldAdvisoryText, foldResultText, foldSkippedLine } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -421,11 +424,63 @@ export default function dmail(pi: ExtensionAPI): void {
 				);
 			}
 
+			// Usage is probed before the record lands so headroom describes the
+			// context this fold is deciding about, not the one it just changed.
+			let usage: { tokens: number | null; contextWindow: number } | undefined;
+			try {
+				usage = typeof ctx.getContextUsage === "function" ? ctx.getContextUsage() : undefined;
+			} catch {
+				// No usage probe (or a throwing one): headroom degrades to unknown.
+			}
+
+			// Advisory economics (ticket 04): what the fold removed, what the cache
+			// will pay back, how much window headroom is left. Every fallible piece is
+			// guarded separately, so the result always carries the advisory while a
+			// fold is never refused, delayed, or altered on economic grounds.
+			//
+			// The fold replaces [fromEntryId, toEntryId): `toEntryId` is documented as
+			// "the first entry kept", so the archive is [start, end) — exactly what
+			// replay drops — and the kept suffix (the other half of the one-time fresh
+			// rewrite) starts at `end`. Both walks use replay's convert() so the
+			// counts match what replay sends.
+			let archiveTokens = 0;
+			let keptAfterTokens: number | null = 0;
+			try {
+				const start = entries.findIndex((entry) => entry.id === target.entryId);
+				const end = entries.findIndex((entry) => entry.id === current.entryId);
+				if (start < 0 || end < start) throw new Error("fold range not in the view");
+				const tokensOf = (entry: SessionEntry): number =>
+					sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateTokens(message), 0);
+				for (const entry of entries.slice(start, end)) archiveTokens += tokensOf(entry);
+				for (const entry of entries.slice(end)) keptAfterTokens += tokensOf(entry);
+			} catch {
+				// A malformed entry can hide tokens: the verdict degrades, the fold does not.
+				archiveTokens = 0;
+				keptAfterTokens = null;
+			}
+			// The memo as replay sends it: wrapSummary's <summary> wrapper is part of
+			// what replaces the archive, so it is part of what the replacement costs.
+			const memoTokens = estimateTokens(userMessage(wrapSummary(params.summary.trim()), Date.now()));
+			// Total by construction (clamped inputs): this cannot throw and cannot
+			// omit a verdict — that is what "always carries the advisory" means.
+			const economics = evaluateEconomics({
+				archiveTokens,
+				memoTokens,
+				keptAfterTokens,
+				contextTokens: typeof usage?.tokens === "number" ? usage.tokens : null,
+				contextWindow: typeof usage?.contextWindow === "number" ? usage.contextWindow : null,
+			});
+
 			pi.appendEntry<FoldRecord>(FOLD_TYPE, {
 				fromEntryId: target.entryId,
 				toEntryId: current.entryId,
 				summary: params.summary.trim(),
 				fromStep: target.step,
+				// Predicted-vs-actual rides the record as well as the result, so offline
+				// scoring (ticket 06) can read it back from the recorded session.
+				// `actual` ships null — economics never gate anything.
+				predicted: economics.predicted,
+				actual: economics.actual,
 			});
 
 			const through = current.step - 1;
@@ -442,20 +497,23 @@ export default function dmail(pi: ExtensionAPI): void {
 			const skipLine = foldSkippedLine(skipped.length);
 			const hasSkips = skipLine !== "";
 			const headline = `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`;
+			const details = {
+				fromStep: target.step,
+				throughStep: through,
+				fromEntryId: target.entryId,
+				toEntryId: current.entryId,
+				economics,
+				predicted: economics.predicted,
+				actual: economics.actual,
+				...(hasSkips ? { skipped: skipped.length } : {}),
+			};
+			// The raw fallback content carries the advisory too: the economics line
+			// and any headroom warning, before the skip count.
+			const advisory = foldAdvisoryText(details);
+			const text = [headline, ...(advisory === "" ? [] : [advisory]), ...(hasSkips ? [skipLine] : [])].join("\n");
 			return {
-				content: [
-					{
-						type: "text" as const,
-						text: hasSkips ? `${headline}\n${skipLine}` : headline,
-					},
-				],
-				details: {
-					fromStep: target.step,
-					throughStep: through,
-					fromEntryId: target.entryId,
-					toEntryId: current.entryId,
-					...(hasSkips ? { skipped: skipped.length } : {}),
-				},
+				content: [{ type: "text" as const, text }],
+				details,
 			};
 		},
 		/**

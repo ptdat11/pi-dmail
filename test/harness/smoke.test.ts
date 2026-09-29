@@ -2,7 +2,7 @@
 // extension against fake pi, execute a fold, and render the folded view.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { CANCEL, createFakeUi, createHarness, SessionFixture, threeStepSession } from "./index.ts";
+import { assertFoldDetails, CANCEL, createFakeUi, createHarness, SessionFixture, threeStepSession } from "./index.ts";
 import { FOLD_TYPE } from "../../fold.ts";
 
 test("harness registers the extension like pi would", async () => {
@@ -30,22 +30,34 @@ test("smoke: execute folds steps and renderResult renders the folded view", asyn
 	const summary = "Opening exchange";
 	const result = await h.execute({ fromStep: 1, summary });
 
-	// The fold record lands both in pi's appends and on the session itself.
+	// Shared fold-result contract (ticket 04): range, advisory economics, and
+	// predicted-vs-actual placeholders; returns details for local checks.
+	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+
+	// The fold record lands both in pi's appends and on the session itself, and
+	// carries the same prediction so offline scoring can read it back (06).
 	assert.equal(h.pi.appended.length, 1);
 	assert.deepEqual(h.pi.appended[0], {
 		customType: FOLD_TYPE,
-		data: { fromEntryId: "e2", toEntryId: "e6", summary, fromStep: 1 },
+		data: {
+			fromEntryId: "e2",
+			toEntryId: "e6",
+			summary,
+			fromStep: 1,
+			predicted: details.predicted,
+			actual: null,
+		},
 	});
 	const persisted = fixture.entries.at(-1);
 	assert.equal(persisted?.type, "custom");
 	assert.equal((persisted as any)?.customType, FOLD_TYPE);
 
-	// Tool result text and details.
-	assert.deepEqual(result.details, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	// Raw fallback: the headline first, the advisory under it.
 	assert.equal(
-		result.content[0].text,
+		result.content[0].text.split("\n")[0],
 		"Folded steps 1 through 2. They are replaced by your summary from the next request on.",
 	);
+	assert.match(result.content[0].text, /tokens removed/);
 
 	// The user-facing notification.
 	assert.deepEqual(h.ui.notifications, [

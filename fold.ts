@@ -16,6 +16,8 @@
  * refuses any range whose end does not strictly follow its start.
  */
 
+import type { ActualEconomics, PredictedEconomics } from "./economics.ts";
+
 /** Custom-entry type used to persist fold records in the session. */
 export const FOLD_TYPE = "dmail.fold";
 
@@ -29,6 +31,14 @@ export interface FoldRecord {
 	summary: string;
 	/** The number the agent used, for readability only. Nothing resolves against it. */
 	fromStep?: number;
+	/**
+	 * Advisory economics predicted at fold time (ticket 04), persisted so offline
+	 * scoring (ticket 06) can compare the prediction against measurements from
+	 * the recorded session. Replay ignores it — economics never gate a fold.
+	 */
+	predicted?: PredictedEconomics | null;
+	/** The actual, measured side; null until scoring fills it in. */
+	actual?: ActualEconomics | null;
 }
 
 /** A fold record paired with the id of the session entry that holds it. */

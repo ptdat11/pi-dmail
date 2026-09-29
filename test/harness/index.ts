@@ -2,6 +2,7 @@
 // fake context (fake UI + fixture-backed session), and exposes small helpers to
 // drive events, execute the fold tool, and render its result — the seam every
 // dmail test drives the extension through.
+import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -55,6 +56,32 @@ export interface Harness {
 		result: any,
 		opts?: { args?: Record<string, unknown>; expanded?: boolean; toolCallId?: string },
 	): { component: any; text: () => string };
+}
+
+/**
+ * Assert the shared contract of every fold result (ticket 04): the range
+ * fields, the advisory economics, and the predicted-vs-actual placeholders
+ * (`actual` ships null until scoring fills it in — ticket 06). Returns the
+ * details so a test can go on asserting its own numbers.
+ */
+export function assertFoldDetails(
+	result: { details?: unknown },
+	expected: { fromStep: number; throughStep: number; fromEntryId: string; toEntryId: string; skipped?: number },
+): Record<string, any> {
+	const details = (result.details ?? {}) as Record<string, any>;
+	assert.equal(details.fromStep, expected.fromStep, "details.fromStep");
+	assert.equal(details.throughStep, expected.throughStep, "details.throughStep");
+	assert.equal(details.fromEntryId, expected.fromEntryId, "details.fromEntryId");
+	assert.equal(details.toEntryId, expected.toEntryId, "details.toEntryId");
+	if (expected.skipped === undefined) {
+		assert.equal(details.skipped, undefined, "no records were skipped");
+	} else {
+		assert.equal(details.skipped, expected.skipped, "details.skipped");
+	}
+	assert.ok(details.economics, "advisory economics ride every fold result");
+	assert.ok(details.predicted, "predicted-vs-actual fields present");
+	assert.equal(details.actual, null, "actual awaits later scoring");
+	return details;
 }
 
 export async function createHarness(options: HarnessOptions = {}): Promise<Harness> {

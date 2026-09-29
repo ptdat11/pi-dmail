@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHarness, SessionFixture } from "./harness/index.ts";
+import { assertFoldDetails, createHarness, SessionFixture } from "./harness/index.ts";
 import { FOLD_TYPE } from "../fold.ts";
 
 /** Plain text of one context message, whatever shape pi's message uses. */
@@ -44,11 +44,16 @@ test("a re-fold from a start inside an existing fold region succeeds", async () 
 	await h.start();
 
 	const first = await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
-	assert.deepEqual(first.details, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	assertFoldDetails(first, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
 
 	// Step 2's assistant is already folded away; the tool must still accept it.
 	const second = await h.execute({ fromStep: 2, summary: "S2 covers step 2" });
-	assert.deepEqual(second.details, { fromStep: 2, throughStep: 2, fromEntryId: "e4", toEntryId: "e6" });
+	const secondDetails = assertFoldDetails(second, {
+		fromStep: 2,
+		throughStep: 2,
+		fromEntryId: "e4",
+		toEntryId: "e6",
+	});
 
 	assert.deepEqual(
 		h.pi.appended.map((entry) => entry.customType),
@@ -60,6 +65,8 @@ test("a re-fold from a start inside an existing fold region succeeds", async () 
 		toEntryId: "e6",
 		summary: "S2 covers step 2",
 		fromStep: 2,
+		predicted: secondDetails.predicted,
+		actual: null,
 	});
 });
 
