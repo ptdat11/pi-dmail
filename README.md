@@ -19,13 +19,15 @@ the loop that actually knows which steps it is done with — and pi gave it no w
 ## How it works
 
 D-Mail adds one tool, `send_dmail(fromStep, summary)`. The agent sees a `[step N]` marker before each
-assistant turn, and calling the tool records that everything from `fromStep` up to the last *completed*
-step is finished with, and that `summary` replaces it. A `context` hook replays those records on every
-request, so the agent is sent the summary instead of the transcript.
+assistant turn, and calling the tool records that everything from `fromStep` through `throughStep` (by
+default, the last *completed* step) is finished with, and that `summary` replaces it. A `context` hook
+replays those records on every request, so the agent is sent the summary instead of the transcript.
 
 The step the agent is currently in is never folded, so it passes the earliest step it is done with, not
-the current one. The end of the range is resolved once, at call time, and frozen: a fold cannot quietly
-swallow every step that follows it. Numbers come from the branch, so a step keeps its number even after
+the current one. The end of the range is resolved once, at call time, and frozen — either the caller's
+`throughStep` or the last completed step — so a fold cannot quietly swallow every step that follows it.
+Both endpoints are step starts, which is what keeps a tool call and its result on the same side of the
+cut. Numbers come from the branch, so a step keeps its number even after
 it is folded away — but markers are only emitted for steps still in view.
 
 The idea is borrowed from Moonshot AI's
@@ -59,7 +61,8 @@ is finished. What you get is a status badge and two commands:
 | --- | --- |
 | Blue `D-MAIL ON` / red `⚠ D-MAIL OFF` badge | Whether folding is active, shown in the footer. |
 | `/dmail` | Toggle folding for the session. Also `/dmail on`, `/dmail off`, `/dmail status`, `/dmail fold`, `/dmail price`. |
-| `/send-dmail` | Alias of `/dmail fold`: opens the picker to pin where the agent folds (`/send-dmail 2` pins a start without one). Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
+| `/dmail fold` | The user owns the cut **range**. Opens a two-phase picker over one stable, latest-first list: enter picks the **start**, enter again picks the **end** (inclusive, defaulted to the latest finished step — so Enter,Enter is the old one-cut behavior), `esc` in phase 2 returns to phase 1, `esc` in phase 1 cancels. The pending range shows as `[A - B]` with its live `~ ≈` figure in the header while the end is picked; rows older than the start are dimmed and the cursor cannot reach them. `Enter` on a folded `[a - b]` region folds the whole region in. The agent is then told the pinned range and writes the summary. Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
+| `/send-dmail` | Alias of `/dmail fold`: opens the picker to pin the range the agent folds (`/send-dmail 2` pins a start, `/send-dmail 2 7` the whole range, no picker needed). Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
 | `--dmail-disabled` | Force folding off for one session, overriding settings (`/dmail` turns it back on). |
 | `dmail.enabled` in `settings.json` | Default mode for new sessions (`false` starts them off). |
 
@@ -103,12 +106,15 @@ injected policy are a floor, not a schedule. Four habits shape the timing, and a
 - **Preview before you commit.** Every fold result carries an advisory line, and `send_dmail`'s `preview`
   parameter prints the same figures *without* folding: predicted tokens removed, predicted savings per
   request, how many requests it takes to break even, and whether the context headroom absorbs the
-  summary. `/dmail price [step] [summary…]` is the read-only command form of the same check. These numbers
+  summary. `/dmail price [start] [end] [summary…]` — a second number is the inclusive end — is the
+  read-only command form of the same check. These numbers
   are advisory — a prediction from the session's own cache behaviour, not a promise — but they are the
   cheap way to see a cut before making it.
-- **The user can pin the cut point.** `/dmail fold` (alias `/send-dmail`) opens a picker listing candidate
-  cuts with their headline figures, so you choose where the ladder rung goes instead of waiting for the
-  agent (`/send-dmail 2` pins a start without the picker). A pinned cut wins; the agent folds from there.
+- **The user can pin the cut range.** `/dmail fold` (alias `/send-dmail`) opens a picker listing candidate
+  cuts with their headline figures, so you choose both ends of the rung instead of waiting for the
+  agent: enter sets the start, enter again sets the end, and the header prices the pending `[A - B]` while
+  you move (`/send-dmail 2` or `/dmail fold 2 7` pins the range without the picker). A pinned range wins;
+  the agent folds there and writes the summary.
 
 The ladder only spans pi's current compaction window. Records written before the last compaction boundary
 are skipped rather than replayed — counted, not erased (`folds skipped: N`), and the ladder restarts above

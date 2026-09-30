@@ -196,6 +196,10 @@ test("/dmail price prints estimates for every candidate cut and folds nothing", 
 	// may honestly read "added" — what matters is that it reports, never gates.
 	assert.match(message, /Would fold steps 1–2/);
 	assert.match(message, /Would fold step 2/);
+	assert.ok(
+		message.indexOf("Would fold step 2") < message.indexOf("Would fold steps 1–2"),
+		"the newest cut is listed first, like every other list a fold reads",
+	);
 	assert.match(message, /tokens (removed|added)/);
 	assert.match(message, /· (saves|costs) ~/);
 	assert.match(message, /cache: /);
@@ -219,6 +223,38 @@ test("/dmail price <step> with the same inputs prints the numbers preview would"
 	assert.match(message, /Would fold steps 1–2/);
 	assert.equal(h.pi.appended.length, 0, "still no fold");
 	assert.equal(h.pi.sentMessages.length, 0, "the agent was not involved");
+});
+
+test("/dmail price <start> <end> prints the figures for exactly the range the fold would freeze", async () => {
+	const h = await createHarness({ fixture: threeStepSession() });
+	await h.start();
+	stubUsage(h);
+
+	const preview = await h.execute({ fromStep: 1, throughStep: 1, summary: SUMMARY, preview: true });
+	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 1, fromEntryId: "e2", toEntryId: "e4" });
+
+	await h.runCommand("dmail", `price 1 1 ${SUMMARY}`);
+
+	const message = lastNotification(h);
+	assert.ok(
+		message.includes(foldEconomicsLine(details)),
+		`price with an end prints the preview's numbers:\n${message}\nvs\n${foldEconomicsLine(details)}`,
+	);
+	assert.match(message, /Would fold step 1/);
+	assert.equal(h.pi.appended.length, 0, "still no fold");
+	assert.equal(h.pi.sentMessages.length, 0, "the agent was not involved");
+});
+
+test("/dmail price <start> <end> reports the fold's own refusal for an end that is not one", async () => {
+	const h = await createHarness({ fixture: threeStepSession() });
+	await h.start();
+
+	await h.runCommand("dmail", "price 1 3");
+
+	const note = h.ui.notifications.at(-1);
+	assert.equal(note?.type, "error");
+	assert.match(note?.message ?? "", /There is no step 3 to fold through\. Ends: \[2, 1\]\./);
+	assert.equal(h.pi.appended.length, 0, "no fold record on a refused range");
 });
 
 test("/dmail price reports the fold's validation errors instead of folding", async () => {

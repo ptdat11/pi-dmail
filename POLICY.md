@@ -104,8 +104,9 @@ Do not fold the step you are in.
 ## How to name steps
 
 Steps are numbered in the conversation as `[step 3]`. Pass the earliest step you
-are done with as `fromStep`. Everything from there up to the last completed step
-is folded, and the step you are in is kept.
+are done with as `fromStep`. Everything from there through `throughStep` (default:
+the last completed step) is folded, and the step you are in is kept. Pass
+`throughStep` explicitly, inclusive, when a later step is still worth keeping raw.
 
 Steps you folded keep their numbers, so the markers can jump (`[step 4]` then
 `[step 12]`) — read the markers, do not count. Folding from a step always carries

@@ -2,6 +2,8 @@
 // notify/setStatus always record; select/input/confirm require a scripted answer,
 // so a test that drives real interaction fails loudly instead of silently cancelling.
 
+import { endStepOf } from "../../picker.ts";
+
 /** Sentinel returned by a script to make select/input cancel (resolve undefined). */
 export const CANCEL = Symbol("fake-ui.cancel");
 
@@ -106,18 +108,45 @@ export function createFakeUi(): FakeUi {
 			customs.push({ component });
 			const answer = take(customScript, "custom");
 			if (answer === CANCEL) {
-				component.handleInput?.("\x1b"); // esc → onCancel → done(undefined)
-			} else {
-				// Walk the selection to the row for this start, then confirm: enter → onSelect → done.
-				const rows: { fromStep?: number }[] = component.rows ?? [];
-				const index = rows.findIndex((row) => row.fromStep === answer);
-				if (index < 0) {
-					done(answer as T); // an unknown start: the caller's lookup resolves it
-				} else {
-					for (let i = 0; i < index; i++) component.handleInput?.("j");
-					component.handleInput?.("\n");
+				component.handleInput?.("\x1b"); // esc in phase 1 → onCancel → done(undefined)
+				return resolved;
+			}
+			// Drive the two-phase picker through its real key handler: walk to the start row
+			// and press enter, then walk to the end row and press enter → onSelect → done.
+			// A number answers the start only (the end stays at its default); an object answers
+			// both ends and may ask for an esc back to phase 1 in between.
+			const rows: any[] = component.rows ?? [];
+			const press = (key: string) => component.handleInput?.(key);
+			const goto = (index: number) => {
+				const here: number = component.state?.cursor ?? 0;
+				for (let i = here; i < index; i++) press("j"); // down
+				for (let i = index; i < here; i++) press("k"); // up
+			};
+			const request = typeof answer === "number" ? { fromStep: answer } : answer;
+			const startAt = rows.findIndex((row) => row.fromStep === request.fromStep);
+			if (startAt < 0) {
+				done(answer as T); // an unknown start: the caller's lookup resolves it
+				return resolved;
+			}
+			goto(startAt);
+			press("\n");
+			if (request.back === true) {
+				press("\x1b"); // esc in phase 2 → back to phase 1, free to pick another start
+				const nextAt = rows.findIndex((row) => row.fromStep === request.thenFromStep);
+				if (nextAt < 0) throw new Error(`fake-ui: no start row for ${request.thenFromStep}`);
+				goto(nextAt);
+				press("\n");
+			}
+			// The default end is what the component itself pre-positioned; a scripted one is walked to.
+			const endStep = request.throughStep ?? component.state?.pending?.throughStep;
+			const endAt = rows.findIndex((row) => endStepOf(row) === endStep);
+			if (endAt >= 0) {
+				goto(endAt);
+				if (component.state?.pending?.throughStep !== endStep) {
+					throw new Error(`fake-ui: the end cursor did not land on step ${endStep}`);
 				}
 			}
+			press("\n");
 			return resolved;
 		},
 		theme,

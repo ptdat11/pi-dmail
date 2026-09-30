@@ -1,12 +1,20 @@
 /**
- * Pure row builder for `/dmail fold` (ticket 07): the replayed view → the rows
- * the interactive picker shows. No pi imports — rows are plain data; index.ts
- * owns the interaction and the delivery of the pinned start to the agent.
+ * Pure row builder for `/dmail fold` (tickets 07 and 12): the replayed view →
+ * the rows the picker shows. No pi imports — rows are plain data; index.ts owns
+ * the interaction and the delivery of the pinned range to the agent.
  *
- * A row pins a START only. The end is always the latest finished step, which
- * `planFold` freezes on the agent's side, so rows never carry an end. Row
- * format follows /tree: `x` for a step, `[a - b]` for a folded region, role +
- * content peek per row, and a quiet `~Nk` estimate as the tail.
+ * A row offers one step (or one collapsed region) as EITHER endpoint. The
+ * picker asks for a start first, then for an end, and both answers come from
+ * this same row list, so the list never has to be rebuilt between phases. A
+ * region row read as a start means "re-fold from there"; read as an end it
+ * means "the whole region goes", which is why `endStepOf` answers with the
+ * region's last step rather than its first.
+ *
+ * Rows are ordered latest first — the step you are in is never a row, so
+ * `rows[0]` is the latest finished step, which is both where the cursor starts
+ * and what the default end means. Row format follows /tree: `x` for a step,
+ * `[a - b]` for a folded region, role + content peek per row, and a quiet `~Nk`
+ * estimate as the tail.
  */
 import type { FoldRecord, NumberedStep } from "./fold.ts";
 import { foldSummaryPreview, fmtTokens } from "./render.ts";
@@ -17,11 +25,11 @@ export type FoldRangeInput = Pick<FoldRecord, "fromEntryId" | "toEntryId" | "fro
 /** One picker option: a step to pin, or an already-folded region collapsed. */
 export interface FoldPickerRow {
 	kind: "step" | "folded";
-	/** The pinned start when this row is chosen. */
+	/** The pinned start when this row is chosen as the START of the range. */
 	fromStep: number;
 	/** Message role of the step ("assistant"), or "fold" for a collapsed region. */
 	role?: string;
-	/** Original [first, last] step of a collapsed region. */
+	/** Original [first, last] step of a collapsed region; its end when chosen as an end. */
 	range?: [number, number];
 	/** Normalized first line of the entry text (or of the fold's summary). */
 	preview: string;
@@ -31,8 +39,19 @@ export interface FoldPickerRow {
 	label: string;
 }
 
-/** The picker's title — the TUI heading and the ui.select dialog share it. */
+/** Both ends of the cut, as the two picker phases answer them. Inclusive at both ends. */
+export interface FoldPin {
+	/** Step the cut starts at (a collapsed region row contributes its original start). */
+	fromStep: number;
+	/** Last step the cut archives (a collapsed region row contributes its last step). */
+	throughStep: number;
+}
+
+/** Phase-1 title, shared by the TUI heading and the ui.select dialog. */
 export const PICKER_TITLE = "Fold from which step?";
+
+/** Phase-2 title (ticket 12): the same list, now read as the far endpoint. */
+export const PICKER_END_TITLE = "Through which step?";
 
 /** One sentence explaining the quiet row estimate, shared by every surface. */
 export const ESTIMATE_LEGEND = "~ ≈ tokens this cut removes (+ = added)";
@@ -49,6 +68,38 @@ export function estimateLine(removedTokens: number): string {
 /** `[2]` for a single-step region, `[2 - 4]` for a span (literal hyphen, like /tree). */
 export function foldBracket(from: number, through: number): string {
 	return from === through ? `[${from}]` : `[${from} - ${through}]`;
+}
+
+/**
+ * What this row means as the END of a range: the last step it archives.
+ * For a plain step that is the step itself; for a collapsed region it is the
+ * region's last step, so choosing the region folds the whole region in.
+ */
+export function endStepOf(row: FoldPickerRow): number {
+	return row.kind === "folded" && row.range ? row.range[1] : row.fromStep;
+}
+
+/**
+ * The ends a range starting at `fromStep` may stop at, latest first: `fromStep`
+ * itself (a single-step fold is legal) up to the latest step before the one you
+ * are in. One predicate on the caller's view, so the fold's refusal, the headless
+ * hint, and the picker's dimmed rows cannot drift apart (ticket 12).
+ */
+export function validEnds(steps: readonly NumberedStep[], current: NumberedStep, fromStep: number): number[] {
+	return steps
+		.filter((step) => step.step >= fromStep && step.step < current.step)
+		.map((step) => step.step)
+		.reverse();
+}
+
+/** The latest finished step in view — never `current.step - 1`, which a folded-away step turns into a step that is not there. */
+export function latestFinishedStep(steps: readonly NumberedStep[], current: NumberedStep): number {
+	return steps.reduce((latest, step) => (step.step < current.step && step.step > latest ? step.step : latest), 0);
+}
+
+/** How a refusal names the ends it just computed, in the same order it printed them. */
+export function endRefusal(chosen: number, ends: readonly number[]): string {
+	return `There is no step ${chosen} to fold through. Ends: [${ends.join(", ")}].`;
 }
 
 export interface BuildFoldPickerRowsInput {
@@ -71,7 +122,7 @@ interface Region {
 	/** Covered steps are [fromPos, toPos) — the record's `to` is exclusive. */
 	fromPos: number;
 	toPos: number;
-	/** Original first step of the region — a legal pinned start. */
+	/** Original first step of the region — still a legal pinned start (a re-fold). */
 	fromStep: number;
 	/** Original last folded step. */
 	throughStep: number;
@@ -82,7 +133,8 @@ interface Region {
 /**
  * Build the picker rows: one row per finished visible step, plus one row per
  * already-folded region labelled with its original step range. Steps inside a
- * region are collapsed away; picking the region row pins its original start.
+ * region are collapsed away; the region row stands for the whole region at both
+ * ends. Rows come out latest first (`rows[0]` = the latest finished step).
  */
 export function buildFoldPickerRows(input: BuildFoldPickerRowsInput): FoldPickerRow[] {
 	const { steps, current, folds = [], previewOf, estimateOf, roleOf } = input;
@@ -163,6 +215,9 @@ export function buildFoldPickerRows(input: BuildFoldPickerRowsInput): FoldPicker
 		});
 	}
 
-	rows.sort((a, b) => a.pos - b.pos);
+	// Latest first, so the default end and the starting cursor are both `rows[0]`.
+	// Every list a fold reads — the picker, the printed fallback, `/dmail price`'
+	// candidates — is ordered this way, newest at the top.
+	rows.sort((a, b) => b.pos - a.pos);
 	return rows.map(({ row }) => row);
 }

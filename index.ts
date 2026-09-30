@@ -27,7 +27,7 @@
  * back. That is the escape hatch if a summary turns out to have dropped something.
  *
  * `/send-dmail` is an alias of `/dmail fold`: the same picker, the same pinned
- * start, the same prompt-delivery path — the user picks the cut point either way.
+ * range, the same prompt-delivery path — the user picks both cut ends either way.
  *
  *   Bounded damage. A fold that no longer resolves is skipped, not applied
  *   partially, and a fold can never separate an assistant message from its tool
@@ -79,7 +79,19 @@ import {
 	foldSummaryPreview,
 } from "./render.ts";
 import { readSettingsFile, resolveDmailEnabled } from "./settings.ts";
-import { buildFoldPickerRows, estimateLine, ESTIMATE_LEGEND, PICKER_TITLE, type FoldPickerRow } from "./picker.ts";
+import {
+	buildFoldPickerRows,
+	endRefusal,
+	endStepOf,
+	estimateLine,
+	ESTIMATE_LEGEND,
+	foldBracket,
+	type FoldPin,
+	latestFinishedStep,
+	PICKER_END_TITLE,
+	PICKER_TITLE,
+	validEnds,
+} from "./picker.ts";
 import { FoldPickerComponent } from "./picker-ui.ts";
 
 /**
@@ -158,16 +170,20 @@ const OFF_MESSAGE =
 	"so anything folded earlier is back in context. Run /dmail again to re-enable.";
 
 /**
- * `/dmail fold` (and its alias `/send-dmail`) pins a START; this is the prompt
- * that delivers it — idle → plain send, busy → followUp. The agent owns the
- * prose: it writes the summary and performs the fold from exactly the pinned step.
+ * `/dmail fold` (and its alias `/send-dmail`) pin a START and an END; this is the
+ * prompt that delivers them — idle → plain send, busy → followUp. The agent owns the
+ * prose: it writes the summary and performs the fold over exactly that range. When the
+ * chosen end is already the last finished step the call goes without `throughStep`,
+ * because that is the frozen default (ticket 12).
  */
-function foldPinPrompt(fromStep: number, throughStep: number): string {
+function foldPinPrompt(fromStep: number, throughStep: number, latestFinishedStep: number): string {
+	const atLatest = throughStep >= latestFinishedStep;
 	return (
-		`The user pinned the cut point: fold from step ${fromStep} through step ${throughStep}. ` +
-		`Fold from exactly step ${fromStep} — the user owns the cut point, and the end is the latest finished step. ` +
-		`Write the summary yourself with send_dmail(fromStep=${fromStep}, summary): put everything later steps depend on into it. ` +
-		`When the fold lands, tell the user the context was folded on their behalf.`
+		`The user pinned the cut: fold from step ${fromStep} through step ${throughStep}` +
+		(atLatest ? ", the latest finished step. " : ". ") +
+		`Fold from exactly step ${fromStep} — the user owns the cut point. ` +
+		`Write the summary yourself with send_dmail(fromStep=${fromStep}${atLatest ? "" : `, throughStep=${throughStep}`}, summary) — ` +
+		`keep everything later steps depend on; tell the user when the fold lands.`
 	);
 }
 
@@ -176,6 +192,7 @@ const FALLBACK_POLICY = [
 	"You have a `send_dmail` tool: it folds a range of finished steps out of your context and replaces them with a summary you write.",
 	"Fold a step as soon as you have taken what you need from it and will not need to read it again. Do not wait for a phase boundary.",
 	"Steps are numbered in the conversation as `[step N]`. Pass the earliest step you are done with as `fromStep`.",
+	"Pass `throughStep` (inclusive) to stop the fold before the last completed step; omit it to fold through the last completed step.",
 ].join("\n");
 
 let cachedPolicy: string | undefined;
@@ -317,7 +334,10 @@ function visibleStepsOf(entries: readonly SessionEntry[], branch: readonly Sessi
 /** A fold fully decided: the validated range, the trimmed summary, its estimate. */
 interface FoldPlan {
 	target: NumberedStep;
-	current: NumberedStep;
+	/** The inclusive end, exactly as the user or agent chose it. */
+	through: number;
+	/** The first step kept: the exclusive end of the archive and of the fold record. */
+	to: NumberedStep;
 	/** The summary as a fold would record it: trimmed. */
 	summary: string;
 	/** How many fold records replay skipped when the view was planned. */
@@ -326,10 +346,41 @@ interface FoldPlan {
 }
 
 /**
+ * The end of a fold, decided once against the live view (ticket 12). `through` is the
+ * inclusive end — the caller's choice, or the last finished step by default — and `to`
+ * is the first step kept, which is what the fold record's exclusive `toEntryId` reads.
+ * Both endpoints are visible step starts, so the record cannot cut a tool call from its
+ * result and replay's pairing invariant stays structural. A chosen end that is not a
+ * visible finished step (older than the start, or the step you are in) refuses by naming
+ * the ends that are valid, in the picker's latest-to-oldest order.
+ */
+function resolveEnd(
+	visibleSteps: readonly NumberedStep[],
+	target: NumberedStep,
+	throughStep: number | undefined,
+): { to: NumberedStep; through: number } {
+	const current = visibleSteps[visibleSteps.length - 1];
+	if (!current || target.step >= current.step) {
+		throw new Error(`Step ${target.step} is the step you are in, so there is nothing finished to fold yet.`);
+	}
+	const ends = validEnds(visibleSteps, current, target.step);
+	// `target.step < current.step`, so `ends` always holds at least the start itself.
+	const chosen = throughStep ?? ends[0]!;
+	if (!ends.includes(chosen)) {
+		throw new Error(endRefusal(chosen, ends));
+	}
+	// `to` is the next step in view, which is the first one a fold over this range keeps.
+	const to = visibleSteps.find((step) => step.step > chosen)!;
+	return { to, through: chosen };
+}
+
+/**
  * Everything a fold decides before it commits: the same validation, throwing
  * the same errors, and the same estimate. The real fold, the tool's `preview`
  * flag, and `/dmail price` all go through here — that is what makes their
  * numbers identical and their refusals symmetric by construction (ticket 05).
+ * Without `throughStep` the end is the last finished step, exactly as before
+ * ticket 12.
  */
 function planFold(
 	entries: readonly SessionEntry[],
@@ -337,6 +388,7 @@ function planFold(
 	fromStep: number,
 	summary: string,
 	ctx: ExtensionContext,
+	throughStep?: number,
 ): FoldPlan {
 	const branchSteps = stepsIn(branch);
 	// Planned before appending: the record this call is about to write is not in
@@ -357,14 +409,11 @@ function planFold(
 		throw new Error("The summary is empty. Write what should replace the folded steps.");
 	}
 
-	// The end is resolved once, here, and frozen. Re-deriving it later would let
-	// the fold keep swallowing every step that follows it.
-	const current = visibleSteps[visibleSteps.length - 1];
-	if (!current || target.step >= current.step) {
-		throw new Error(`Step ${fromStep} is the step you are in, so there is nothing finished to fold yet.`);
-	}
+	// The end is resolved once, here, and frozen. Re-deriving it later would let the
+	// fold keep swallowing every step that follows it, including an end the user chose.
+	const { to, through } = resolveEnd(visibleSteps, target, throughStep);
 
-	return estimateFold(entries, target, current, trimmed, skipped.length, ctx);
+	return estimateFold(entries, target, to, through, trimmed, skipped.length, ctx);
 }
 
 /**
@@ -376,7 +425,8 @@ function planFold(
 function estimateFold(
 	entries: readonly SessionEntry[],
 	target: NumberedStep,
-	current: NumberedStep,
+	to: NumberedStep,
+	through: number,
 	summary: string,
 	skipped: number,
 	ctx: ExtensionContext,
@@ -404,7 +454,7 @@ function estimateFold(
 	let keptAfterTokens: number | null = 0;
 	try {
 		const start = entries.findIndex((entry) => entry.id === target.entryId);
-		const end = entries.findIndex((entry) => entry.id === current.entryId);
+		const end = entries.findIndex((entry) => entry.id === to.entryId);
 		if (start < 0 || end < start) throw new Error("fold range not in the view");
 		const tokensOf = (entry: SessionEntry): number =>
 			sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateTokens(message), 0);
@@ -428,7 +478,7 @@ function estimateFold(
 		contextWindow: typeof usage?.contextWindow === "number" ? usage.contextWindow : null,
 	});
 
-	return { target, current, summary, skipped, economics };
+	return { target, through, to, summary, skipped, economics };
 }
 
 /**
@@ -442,33 +492,40 @@ const PRICE_SUMMARY_SAMPLE =
 	"Opening exchange: the goal, the constraints decided there, and the two decisions later steps still depend on.";
 
 /**
- * `/dmail price [step] [summary…]` — estimates without commitment. Prints
+ * `/dmail price [start] [end] [summary…]` — estimates without commitment. Prints
  * through notify (the command output seam), appends nothing, and sends the
- * agent nothing. A bad start reports the fold's own refusal as an error.
+ * agent nothing. A bad start reports the fold's own refusal as an error, and so
+ * does an end the fold would refuse (ticket 12: price and fold share planFold).
+ * A second number is the inclusive end; anything else there starts the summary.
  */
 function priceCommand(ctx: ExtensionContext, rest: string): void {
 	const entries = ctx.sessionManager.buildContextEntries();
 	const branch = ctx.sessionManager.getBranch();
 	const words = rest === "" ? [] : rest.split(/\s+/);
 	const stepToken = words[0];
-	const summaryText = words.slice(1).join(" ").trim();
+	const endToken = /^\d+$/.test(words[1] ?? "") ? words[1] : undefined;
+	const summaryText = words.slice(endToken === undefined ? 1 : 2).join(" ").trim();
 
 	if (stepToken === undefined) {
 		// Every candidate cut: a visible step with at least one finished step after it.
 		const visibleSteps = visibleStepsOf(entries, branch);
 		const current = visibleSteps[visibleSteps.length - 1];
-		const candidates = current ? visibleSteps.filter((step) => step.step < current.step) : [];
+		const candidates = current ? visibleSteps.filter((step) => step.step < current.step).reverse() : [];
 		if (!current || candidates.length === 0) {
 			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
 			return;
 		}
 		const { skipped } = planForView(entries, branch);
-		const plans = candidates.map((target) =>
-			estimateFold(entries, target, current, PRICE_SUMMARY_SAMPLE, skipped.length, ctx),
-		);
+		// Each candidate is priced at the end the fold would itself freeze for it, so the
+		// headline and the figures describe the cut that would actually happen — not an
+		// arithmetic guess a folded-away step turns into a step that is not there.
+		const plans = candidates.map((target) => {
+			const end = resolveEnd(visibleSteps, target, undefined);
+			return estimateFold(entries, target, end.to, end.through, PRICE_SUMMARY_SAMPLE, skipped.length, ctx);
+		});
 		const rows = plans.map(
 			(plan) =>
-				`${foldHeadline({ fromStep: plan.target.step, throughStep: plan.current.step - 1, preview: true })} · ` +
+				`${foldHeadline({ fromStep: plan.target.step, throughStep: plan.through, preview: true })} · ` +
 				foldEconomicsLine({ economics: plan.economics }),
 		);
 		// Headroom and skips describe this view once, not each cut — all share them.
@@ -480,7 +537,7 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 				...rows,
 				...(headroom === "" ? [] : [headroom]),
 				...(skipLine === "" ? [] : [skipLine]),
-				"For an exact cut: /dmail price <step> <summary> — the same numbers the preview flag reports.",
+				"For an exact cut: /dmail price <start> [<end>] <summary> — the same numbers the preview flag reports.",
 			].join("\n"),
 			"info",
 		);
@@ -495,10 +552,17 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 	}
 	const fromStep = Number(stepToken);
 	try {
-		const plan = planFold(entries, branch, fromStep, summaryText === "" ? PRICE_SUMMARY_SAMPLE : summaryText, ctx);
+		const plan = planFold(
+			entries,
+			branch,
+			fromStep,
+			summaryText === "" ? PRICE_SUMMARY_SAMPLE : summaryText,
+			ctx,
+			endToken === undefined ? undefined : Number(endToken),
+		);
 		const details = {
 			fromStep: plan.target.step,
-			throughStep: plan.current.step - 1,
+			throughStep: plan.through,
 			economics: plan.economics,
 			preview: true,
 		};
@@ -523,9 +587,9 @@ export default function dmail(pi: ExtensionAPI): void {
 	// the session that asked for it — the same choice bash-guard made. The *starting*
 	// value is a setting (settings.json `dmail.enabled`); this only overrides it.
 	let enabled = true;
-	// The start last pinned through `/dmail fold`: consumed by the next real fold
+	// The range last pinned through `/dmail fold`: consumed by the next real fold
 	// so its confirmation can tell the user the fold happened on their behalf.
-	let pinnedFromStep: number | undefined;
+	let pinned: { fromStep: number; throughStep: number } | undefined;
 	// True only while *we* are the ones hiding the tool, so that re-enabling does not
 	// hand send_dmail back to a user who had deliberately deactivated it.
 	let toolSuppressed = false;
@@ -577,13 +641,14 @@ export default function dmail(pi: ExtensionAPI): void {
 	});
 
 	/**
-	 * `/dmail fold` — the user owns the cut point, the agent owns the prose.
+	 * `/dmail fold` — the user owns the cut range, the agent owns the prose.
 	 * Rows come from the replayed view (visible steps + one row per folded
-	 * region); picking a row pins only the START and hands it to the agent via
-	 * the standard prompt path (plain when idle, followUp when busy). This one
-	 * function serves both `/dmail fold` and its alias `/send-dmail`. Cancel
-	 * changes nothing; without an interactive UI the printed list plus
-	 * `/dmail fold <step>` keeps headless sessions working.
+	 * region) latest first, and every row can be either endpoint: the picker asks
+	 * for a start, then for an end through the same list, and the pair is handed
+	 * to the agent via the standard prompt path (plain when idle, followUp when
+	 * busy). This one function serves both `/dmail fold` and its alias
+	 * `/send-dmail`. Cancel changes nothing; without an interactive UI the printed
+	 * list plus `/dmail fold <start> [<end>]` keeps headless sessions working.
 	 */
 	async function foldCommand(ctx: ExtensionContext, rest: string, invocation: string): Promise<void> {
 		// Shared guards for /dmail fold and /send-dmail: an unreachable fold helps no one.
@@ -605,103 +670,149 @@ export default function dmail(pi: ExtensionAPI): void {
 		const current = visible[visible.length - 1];
 		const plan = planForView(entries, branch);
 		const entryById = new Map(entries.map((entry) => [entry.id, entry]));
-		const estimates = new Map<number, string | undefined>();
+		// One pricing walk per (start, end) pair, memoised: the picker asks for a row's
+		// figure on every redraw, and for each pending range once while the end is picked.
+		const priced = new Map<string, string | undefined>();
+		const estimateFor = (fromStep: number, throughStep: number): string | undefined => {
+			const key = `${fromStep}\u2192${throughStep}`;
+			if (priced.has(key)) return priced.get(key);
+			const target = visible.find((step) => step.step === fromStep);
+			const to = visible.find((step) => step.step > throughStep);
+			let line: string | undefined;
+			if (target && to) {
+				const range = estimateFold(entries, target, to, throughStep, PRICE_SUMMARY_SAMPLE, plan.skipped.length, ctx);
+				line = estimateLine(range.economics.removedTokens);
+			}
+			priced.set(key, line);
+			return line;
+		};
+		// The ends a fold from this start may stop at, latest first — the very list the
+		// fold's own endpoint validation reads, so a refusal never names a refused step.
+		const endsFrom = (fromStep: number): number[] => validEnds(visible, current, fromStep);
+		// A number to suggest when an end was missing or unparseable: the end this start
+		// would have taken by default, or the latest finished step if it has none.
+		const endsHint = (fromStep: number): number => endsFrom(fromStep)[0] ?? latestFinished;
+		// The end a pin takes when the user chose only a start. Read off the view, because
+		// step numbers keep their gaps once steps are folded away.
+		const latestFinished = latestFinishedStep(visible, current);
 		const rows = buildFoldPickerRows({
 			steps: visible,
 			current,
 			folds: plan.inEra,
 			roleOf: (step) => entryRole(entryById.get(step.entryId)),
 			previewOf: (step) => foldSummaryPreview(entryText(entryById.get(step.entryId))),
-			estimateOf: (fromStep) => {
-				// One estimateWalk per row, memoised across redraws of the same rows.
-				if (estimates.has(fromStep)) return estimates.get(fromStep);
-				const target = visible.find((step) => step.step === fromStep);
-				let line: string | undefined;
-				if (target) {
-					const planForStart = estimateFold(entries, target, current, PRICE_SUMMARY_SAMPLE, plan.skipped.length, ctx);
-					line = estimateLine(planForStart.economics.removedTokens);
-				}
-				estimates.set(fromStep, line);
-				return line;
-			},
+			estimateOf: (fromStep) => estimateFor(fromStep, latestFinished),
 		});
 		if (rows.length === 0) {
 			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
 			return;
 		}
 
-		// Deliver the pinned start: plain when idle, followUp when the agent is busy.
-		const pin = (row: FoldPickerRow): void => {
-			pinnedFromStep = row.fromStep;
-			const prompt = foldPinPrompt(row.fromStep, current.step - 1);
+		// Deliver the pinned range: plain when idle, followUp when the agent is busy.
+		const pin = (fromStep: number, throughStep: number): void => {
+			pinned = { fromStep, throughStep };
+			const cut = foldBracket(fromStep, throughStep);
+			const prompt = foldPinPrompt(fromStep, throughStep, latestFinished);
 			if (ctx.isIdle()) {
 				pi.sendUserMessage(prompt);
-				ctx.ui.notify(`Pinned step ${row.fromStep} — the agent will fold from there and write the summary.`, "info");
+				ctx.ui.notify(`Pinned ${cut} — the agent will fold and write the summary.`, "info");
 			} else {
 				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-				ctx.ui.notify(`Pinned step ${row.fromStep}. The agent will fold once it finishes the current turn.`, "info");
+				ctx.ui.notify(`Pinned ${cut}. The agent will fold once it finishes the current turn.`, "info");
 			}
 		};
 
-		// A pick from either dialog: find the row it names, or report the cancel.
-		const pinChosen = (row: FoldPickerRow | undefined): void => {
-			if (!row) {
-				ctx.ui.notify("Cancelled — nothing was folded.", "info");
+		// Explicit endpoints: `/dmail fold 2` or `/dmail fold 2 7` — the headless way to pin a range.
+		const args = rest.trim() === "" ? [] : rest.trim().split(/\s+/);
+		if (args.length > 0) {
+			const [startToken, endToken, ...extra] = args;
+			if (!/^\d+$/.test(startToken)) {
+				ctx.ui.notify(`"${startToken}" is not a step number. Try /${invocation} 2.`, "error");
 				return;
 			}
-			pin(row);
-		};
-
-		// Explicit start: `/dmail fold 2` — the headless way to pin a row.
-		const arg = rest.trim();
-		if (arg !== "") {
-			if (!/^\d+$/.test(arg)) {
-				ctx.ui.notify(`"${arg}" is not a step number. Try /${invocation} 2.`, "error");
+			if (endToken !== undefined && !/^\d+$/.test(endToken)) {
+				const suggested = endsHint(Number(startToken));
+				ctx.ui.notify(`"${endToken}" is not a step number. Try /${invocation} ${startToken} ${suggested}.`, "error");
 				return;
 			}
-			const row = rows.find((candidate) => candidate.fromStep === Number(arg));
+			if (extra.length > 0) {
+				ctx.ui.notify(`A fold takes a start and an end, not "${extra.join(" ")}". Try /${invocation} ${startToken}.`, "error");
+				return;
+			}
+			const row = rows.find((candidate) => candidate.fromStep === Number(startToken));
 			if (!row) {
 				ctx.ui.notify(
-					`There is no step ${arg} to fold from. Starts: [${rows.map((candidate) => candidate.fromStep).join(", ")}].`,
+					`There is no step ${startToken} to fold from. Starts: [${rows.map((candidate) => candidate.fromStep).join(", ")}].`,
 					"error",
 				);
 				return;
 			}
-			pin(row);
+			// No end means the frozen default: the latest finished step, as before ticket 12.
+			const fromStep = row.fromStep;
+			const ends = endsFrom(fromStep);
+			const throughStep = endToken === undefined ? ends[0] : Number(endToken);
+			if (!ends.includes(throughStep)) {
+				ctx.ui.notify(`There is no step ${throughStep} to fold through. Ends: [${ends.join(", ")}].`, "error");
+				return;
+			}
+			pin(fromStep, throughStep);
 			return;
 		}
 
-		// The /tree-style TUI picker when a TUI can host it, ui.select for rpc-style
-		// UIs, and the printed list to keep headless sessions working.
+		// The /tree-style TUI picker when a TUI can host it (one component, two phases),
+		// ui.select for rpc-style UIs (two dialogs, esc from the second returns to the
+		// first), and the printed list to keep headless sessions working.
 		if (ctx.hasUI !== false && typeof ctx.ui.custom === "function") {
-			const chosen = await ctx.ui.custom<number | undefined>(
+			const pinResult = await ctx.ui.custom<FoldPin | undefined>(
 				(tui, theme, keybindings, done) =>
 					new FoldPickerComponent({
 						rows,
 						theme,
 						terminalRows: tui.terminal?.rows ?? 40,
 						keybindings,
+						rangeEstimate: (fromStep, throughStep) => estimateFor(fromStep, throughStep),
 						onSelect: done,
 						onCancel: () => done(undefined),
 					}),
 			);
-			pinChosen(chosen === undefined ? undefined : rows.find((candidate) => candidate.fromStep === chosen));
+			if (pinResult === undefined) {
+				ctx.ui.notify("Cancelled — nothing was folded.", "info");
+			} else {
+				pin(pinResult.fromStep, pinResult.throughStep);
+			}
 			return;
 		}
 
 		if (ctx.hasUI !== false && typeof ctx.ui.select === "function") {
-			const chosen = await ctx.ui.select(
-				`${PICKER_TITLE} The step you are in is kept. ${ESTIMATE_LEGEND}.`,
-				rows.map((row) => row.label),
-			);
-			pinChosen(chosen === undefined ? undefined : rows.find((candidate) => candidate.label === chosen));
-			return;
+			// One loop, two dialogs: esc in the end dialog discards the start and shows
+			// the full list again; esc in the start dialog is the only way out.
+			for (;;) {
+				const startLabel = await ctx.ui.select(
+					`${PICKER_TITLE} The step you are in is kept. ${ESTIMATE_LEGEND}.`,
+					rows.map((row) => row.label),
+				);
+				const startRow = startLabel === undefined ? undefined : rows.find((row) => row.label === startLabel);
+				if (!startRow) {
+					ctx.ui.notify("Cancelled — nothing was folded.", "info");
+					return;
+				}
+				const fromStep = startRow.fromStep;
+				const ends = endsFrom(fromStep);
+				const endRows = rows.filter((row) => ends.includes(endStepOf(row)));
+				const endLabel = await ctx.ui.select(`${PICKER_END_TITLE} (start: ${fromStep})`, endRows.map((row) => row.label));
+				if (endLabel === undefined) continue; // esc → back to the start list
+				const endRow = endRows.find((row) => row.label === endLabel);
+				if (endRow) {
+					pin(fromStep, endStepOf(endRow));
+					return;
+				}
+			}
 		}
 
 		// No dialog-capable UI (print/json mode): print the list.
 		ctx.ui.notify(
 			[
-				`No interactive picker here — pin a start with /${invocation} <step>: ${ESTIMATE_LEGEND}.`,
+				`No interactive picker here — pin a range with /${invocation} <start> [<end>]: ${ESTIMATE_LEGEND}.`,
 				...rows.map((row) => `· ${row.label}`),
 			].join("\n"),
 			"info",
@@ -749,11 +860,11 @@ export default function dmail(pi: ExtensionAPI): void {
 	});
 
 	// The classic entry point, now an alias of `/dmail fold`: same picker, same
-	// pinned start, same delivery path. Arguments mean the same thing —
-	// `/send-dmail 2` pins a start without opening a picker.
+	// pinned range, same delivery path. Arguments mean the same thing —
+	// `/send-dmail 2` pins a start, `/send-dmail 2 7` pins the whole range.
 	pi.registerCommand("send-dmail", {
 		description:
-			"Pick where D-Mail folds: the same picker and pinned start as /dmail fold (an explicit step works without one).",
+			"Pick the range D-Mail folds: the same picker and pinned range as /dmail fold (explicit steps work without one).",
 		handler: async (args, ctx) => {
 			await foldCommand(ctx, args, "send-dmail");
 		},
@@ -871,7 +982,7 @@ export default function dmail(pi: ExtensionAPI): void {
 		label: "Send D-Mail",
 		description:
 			"Fold a range of finished steps out of your context and replace them with a summary you write. " +
-			"Everything from `fromStep` up to the last completed step stops being sent; the step you are in is kept. " +
+			"Everything from `fromStep` through `throughStep` (default: the last completed step) stops being sent; the step you are in is kept. " +
 			"Nothing is deleted from the session or from disk, so folding too much costs only a re-read. " +
 			"Pass `preview` to get the same estimates without folding.",
 		promptSnippet: "send_dmail — fold finished steps out of context, replacing them with a summary you write",
@@ -879,6 +990,13 @@ export default function dmail(pi: ExtensionAPI): void {
 			fromStep: Type.Number({
 				description: "Number of the earliest step to fold, as shown by the [step N] markers.",
 			}),
+			throughStep: Type.Optional(
+				Type.Number({
+					description:
+						"Number of the last step to fold, inclusive. Omit to fold through the last completed step; " +
+						"the step you are in is never folded.",
+				}),
+			),
 			summary: Type.String({
 				description: "What replaces the folded steps. Include everything later steps depend on.",
 			}),
@@ -900,12 +1018,12 @@ export default function dmail(pi: ExtensionAPI): void {
 
 			// One path decides everything: validation (identical errors) and the
 			// estimate (identical numbers) live in planFold, so this call, its own
-			// `preview` flag, and `/dmail price` cannot drift apart.
+			// `preview` flag, and `/dmail price` cannot drift apart. An omitted
+			// `throughStep` keeps the frozen end: the last completed step.
 			const entries = ctx.sessionManager.buildContextEntries();
 			const branch = ctx.sessionManager.getBranch();
-			const plan = planFold(entries, branch, params.fromStep, params.summary, ctx);
-			const { target, current, economics, summary: trimmedSummary, skipped } = plan;
-			const through = current.step - 1;
+			const plan = planFold(entries, branch, params.fromStep, params.summary, ctx, params.throughStep);
+			const { target, to, through, economics, summary: trimmedSummary, skipped } = plan;
 
 			// Skipped records are counted, never dropped silently: the count rides the
 			// result so every view of it (raw fallback, collapsed, expanded) can say so.
@@ -915,7 +1033,7 @@ export default function dmail(pi: ExtensionAPI): void {
 				fromStep: target.step,
 				throughStep: through,
 				fromEntryId: target.entryId,
-				toEntryId: current.entryId,
+				toEntryId: to.entryId,
 				economics,
 				predicted: economics.predicted,
 				actual: economics.actual,
@@ -938,9 +1056,12 @@ export default function dmail(pi: ExtensionAPI): void {
 				};
 			}
 
+			// Both endpoints come from resolveEnd, so both are step starts and the
+			// exclusive end is the first kept step's entry: a fold can never cut a tool
+			// call from its result, whatever end the user or agent chose.
 			pi.appendEntry<FoldRecord>(FOLD_TYPE, {
 				fromEntryId: target.entryId,
-				toEntryId: current.entryId,
+				toEntryId: to.entryId,
 				summary: trimmedSummary,
 				fromStep: target.step,
 				// Predicted-vs-actual rides the record as well as the result, so offline
@@ -950,12 +1071,11 @@ export default function dmail(pi: ExtensionAPI): void {
 				actual: economics.actual,
 			});
 
-			// A fold from the start the user pinned through `/dmail fold` says so in
-			// the confirmation; any real fold consumes the pin, so it can only ever
-			// describe one fold (ticket 07: "folded on their behalf").
-			const behalf =
-				pinnedFromStep === target.step ? " Folded on your behalf from the step you pinned." : "";
-			pinnedFromStep = undefined;
+			// A fold over the range the user pinned through `/dmail fold` says so in the
+			// confirmation, naming the range; any real fold consumes the pin, so it can
+			// only ever describe one fold (ticket 07: "folded on their behalf").
+			const behalf = pinned?.fromStep === target.step ? ` Folded on your behalf ${foldBracket(target.step, through)}.` : "";
+			pinned = undefined;
 			// Best effort: a fold that succeeded must not be reported as a failure just
 			// because the front end could not draw a notification.
 			try {
