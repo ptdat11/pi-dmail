@@ -14,8 +14,10 @@ import {
 	endStepOf,
 	estimateLine,
 	ESTIMATE_LEGEND,
+	latestFinishedStep,
 	PICKER_END_TITLE,
 	PICKER_TITLE,
+	validEnds,
 } from "../picker.ts";
 import type { NumberedStep } from "../fold.ts";
 
@@ -111,6 +113,29 @@ test("role, peek and estimate are optional parts of the label", () => {
 		rows.map((r) => r.label),
 		["4", "3", "2", "1"],
 	);
+});
+
+test("with no round in progress, the newest step is a row like any other", () => {
+	const rows = buildFoldPickerRows({ steps: fiveSteps(), previewOf: () => "", roleOf });
+
+	assert.deepEqual(
+		rows.map((r) => r.fromStep),
+		[5, 4, 3, 2, 1],
+		"nothing running means nothing is held back",
+	);
+	assert.equal(endStepOf(rows[0]), 5, "the newest step is also the default end");
+});
+
+test("validEnds and latestFinishedStep follow whether a round is in flight", () => {
+	const steps = fiveSteps();
+	const current = steps[steps.length - 1];
+
+	assert.deepEqual(validEnds(steps, current, 3), [4, 3], "the round in flight is never an end");
+	assert.deepEqual(validEnds(steps, undefined, 3), [5, 4, 3], "idle, the newest step is a legal end");
+	assert.deepEqual(validEnds(steps, current, 5), [], "the round in flight has nothing after it");
+	assert.deepEqual(validEnds(steps, undefined, 5), [5], "idle, A == B is the whole cut");
+	assert.equal(latestFinishedStep(steps, current), 4);
+	assert.equal(latestFinishedStep(steps, undefined), 5);
 });
 
 test("estimateLine renders the compact ~Nk figure (+ for a memo that outweighs the archive)", () => {

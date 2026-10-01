@@ -191,13 +191,15 @@ test("/dmail price prints estimates for every candidate cut and folds nothing", 
 
 	const message = lastNotification(h);
 	assert.match(message, /Candidate cuts/);
-	// Both candidate cuts: from step 1 (through 2) and from step 2. The tiny
-	// fixture archive can be smaller than any real memo, so the economics line
-	// may honestly read "added" — what matters is that it reports, never gates.
-	assert.match(message, /Would fold steps 1–2/);
-	assert.match(message, /Would fold step 2/);
+	// Nothing is running, so every step is a candidate and every cut runs to the newest
+	// step: from 3, from 2, from 1. The tiny fixture archive can be smaller than any real
+	// memo, so the economics line may honestly read "added" — what matters is that it
+	// reports, never gates.
+	assert.match(message, /Would fold step 3/);
+	assert.match(message, /Would fold steps 2–3/);
+	assert.match(message, /Would fold steps 1–3/);
 	assert.ok(
-		message.indexOf("Would fold step 2") < message.indexOf("Would fold steps 1–2"),
+		message.indexOf("Would fold step 3") < message.indexOf("Would fold steps 1–3"),
 		"the newest cut is listed first, like every other list a fold reads",
 	);
 	assert.match(message, /tokens (removed|added)/);
@@ -205,8 +207,63 @@ test("/dmail price prints estimates for every candidate cut and folds nothing", 
 	assert.match(message, /cache: /);
 });
 
+test("/dmail price with a round in flight prices the cuts that end before it", async () => {
+	const h = await createHarness({ fixture: threeStepSession(), idle: false });
+	await h.start();
+	stubUsage(h);
+
+	await h.runCommand("dmail", "price");
+
+	const message = lastNotification(h);
+	// The newest step is the round in progress, so no candidate starts or ends there.
+	assert.match(message, /Would fold steps 1–2/);
+	assert.match(message, /Would fold step 2/);
+	assert.doesNotMatch(message, /Would fold step 3/, "the in-progress step is not a candidate while it runs");
+	// Each cut keeps that round, so the rebuild is knowable and the verdict is real.
+	assert.doesNotMatch(message, /rebuild unknowable/, "a cut that keeps a step can price its rebuild");
+});
+
+test("a cut that runs to the newest step says its rebuild is unknowable, and a cut that keeps a step does not", async () => {
+	// Big steps so the archive clearly beats the stand-in memo: the honest "unknown"
+	// verdict only surfaces when the cut actually saves, since "never-pays" outranks it.
+	const bigSession = (): SessionFixture => {
+		const big = (n: number) => "x".repeat(2_000) + ` step ${n}`;
+		const fx = new SessionFixture();
+		fx.user("q1");
+		fx.assistant(big(1));
+		fx.user("q2");
+		fx.assistant(big(2));
+		fx.user("q3");
+		fx.assistant(big(3));
+		return fx;
+	};
+
+	const idleRun = await createHarness({ fixture: bigSession() });
+	await idleRun.start();
+	stubUsage(idleRun);
+	await idleRun.runCommand("dmail", "price");
+	const idleMessage = lastNotification(idleRun);
+	assert.match(idleMessage, /cache: unknown \(rebuild unknowable\)/, "nothing follows an open-ended cut yet");
+	// Every candidate ends at the newest step, so every row is open-ended: a list where
+	// only the last one is would mean the other two were priced with a kept suffix.
+	assert.equal(
+		(idleMessage.match(/rebuild unknowable/g) ?? []).length,
+		3,
+		"all three open-ended candidates report an unknowable rebuild",
+	);
+
+	const busyRun = await createHarness({ fixture: bigSession(), idle: false });
+	await busyRun.start();
+	stubUsage(busyRun);
+	await busyRun.runCommand("dmail", "price 1 2");
+	const busyMessage = lastNotification(busyRun);
+	assert.doesNotMatch(busyMessage, /rebuild unknowable/, "a cut that keeps the next step can price its rebuild");
+});
+
 test("/dmail price <step> with the same inputs prints the numbers preview would", async () => {
-	const h = await createHarness({ fixture: threeStepSession() });
+	// In flight, because `preview` is the tool's own view of the same range: the tool can
+	// only ever fold a range that ends below its own round, and price must agree with it.
+	const h = await createHarness({ fixture: threeStepSession(), idle: false });
 	await h.start();
 	stubUsage(h);
 
@@ -249,12 +306,23 @@ test("/dmail price <start> <end> reports the fold's own refusal for an end that 
 	const h = await createHarness({ fixture: threeStepSession() });
 	await h.start();
 
-	await h.runCommand("dmail", "price 1 3");
+	await h.runCommand("dmail", "price 1 4");
 
 	const note = h.ui.notifications.at(-1);
 	assert.equal(note?.type, "error");
-	assert.match(note?.message ?? "", /There is no step 3 to fold through\. Ends: \[2, 1\]\./);
+	assert.match(note?.message ?? "", /There is no step 4 to fold through\. Ends: \[3, 2, 1\]\./);
 	assert.equal(h.pi.appended.length, 0, "no fold record on a refused range");
+});
+
+test("/dmail price refuses the newest step as an end while a round is in flight", async () => {
+	const h = await createHarness({ fixture: threeStepSession(), idle: false });
+	await h.start();
+
+	await h.runCommand("dmail", "price 1 3");
+
+	const note = h.ui.notifications.at(-1);
+	assert.equal(note?.type, "error", "an end that is not one is an error, not a priced cut");
+	assert.match(note?.message ?? "", /There is no step 3 to fold through\. Ends: \[2, 1\]\./);
 });
 
 test("/dmail price reports the fold's validation errors instead of folding", async () => {
@@ -274,7 +342,9 @@ test("/dmail price says so when nothing is finished to fold", async () => {
 	const fx = new SessionFixture();
 	fx.user("only question");
 	fx.assistant("only answer");
-	const h = await createHarness({ fixture: fx });
+	// In flight: on an idle session that one step is itself foldable, so there would be
+	// a candidate to print. This test is about having nothing to fold at all.
+	const h = await createHarness({ fixture: fx, idle: false });
 	await h.start();
 
 	await h.runCommand("dmail", "price");

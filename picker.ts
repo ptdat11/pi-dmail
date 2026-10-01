@@ -10,9 +10,10 @@
  * means "the whole region goes", which is why `endStepOf` answers with the
  * region's last step rather than its first.
  *
- * Rows are ordered latest first — the step you are in is never a row, so
- * `rows[0]` is the latest finished step, which is both where the cursor starts
- * and what the default end means. Row format follows /tree: `x` for a step,
+ * Rows are ordered latest first, so `rows[0]` is the latest foldable step —
+ * both where the cursor starts and what the default end means. A step in
+ * progress is never a row; with nothing running, the newest step is offered
+ * like any other. Row format follows /tree: `x` for a step,
  * `[a - b]` for a folded region, role + content peek per row, and a quiet `~Nk`
  * estimate as the tail.
  */
@@ -81,20 +82,34 @@ export function endStepOf(row: FoldPickerRow): number {
 
 /**
  * The ends a range starting at `fromStep` may stop at, latest first: `fromStep`
- * itself (a single-step fold is legal) up to the latest step before the one you
- * are in. One predicate on the caller's view, so the fold's refusal, the headless
- * hint, and the picker's dimmed rows cannot drift apart (ticket 12).
+ * itself (a single-step fold is legal) up to the latest foldable step. `current`
+ * is the step in progress, which is never foldable — omit it when nothing is
+ * running (an idle session) and the newest step in view becomes a legal end
+ * too, because the round that does the folding is a step start after it.
+ * One predicate on the caller's view, so the fold's refusal, the headless hint,
+ * and the picker's dimmed rows cannot drift apart (tickets 12 and 13).
  */
-export function validEnds(steps: readonly NumberedStep[], current: NumberedStep, fromStep: number): number[] {
+export function validEnds(
+	steps: readonly NumberedStep[],
+	current: NumberedStep | undefined,
+	fromStep: number,
+): number[] {
 	return steps
-		.filter((step) => step.step >= fromStep && step.step < current.step)
+		.filter((step) => step.step >= fromStep && (current === undefined || step.step < current.step))
 		.map((step) => step.step)
 		.reverse();
 }
 
-/** The latest finished step in view — never `current.step - 1`, which a folded-away step turns into a step that is not there. */
-export function latestFinishedStep(steps: readonly NumberedStep[], current: NumberedStep): number {
-	return steps.reduce((latest, step) => (step.step < current.step && step.step > latest ? step.step : latest), 0);
+/**
+ * The latest foldable step in view — never `current.step - 1`, which a
+ * folded-away step turns into a step that is not there. With no step in
+ * progress that is simply the newest step.
+ */
+export function latestFinishedStep(steps: readonly NumberedStep[], current: NumberedStep | undefined): number {
+	return steps.reduce(
+		(latest, step) => (step.step > latest && (current === undefined || step.step < current.step) ? step.step : latest),
+		0,
+	);
 }
 
 /** How a refusal names the ends it just computed, in the same order it printed them. */
@@ -105,8 +120,11 @@ export function endRefusal(chosen: number, ends: readonly number[]): string {
 export interface BuildFoldPickerRowsInput {
 	/** Visible steps of the replayed view, ascending (NumberedStep.index = position). */
 	steps: readonly NumberedStep[];
-	/** The step the agent is in — never a start, so never a row. */
-	current: NumberedStep;
+	/**
+	 * The step in progress — never a start, so never a row. Omit it when nothing is
+	 * running and the newest step in view is offered like any other.
+	 */
+	current?: NumberedStep;
 	/** Folds that replay in this view (planForView().inEra). */
 	folds?: readonly FoldRangeInput[];
 	/** First-line preview for a step row; blank/undefined omits the part. */
@@ -134,7 +152,8 @@ interface Region {
  * Build the picker rows: one row per finished visible step, plus one row per
  * already-folded region labelled with its original step range. Steps inside a
  * region are collapsed away; the region row stands for the whole region at both
- * ends. Rows come out latest first (`rows[0]` = the latest finished step).
+ * ends. Rows come out latest first (`rows[0]` = the latest foldable step, which
+ * is the newest step in view whenever nothing is in progress).
  */
 export function buildFoldPickerRows(input: BuildFoldPickerRowsInput): FoldPickerRow[] {
 	const { steps, current, folds = [], previewOf, estimateOf, roleOf } = input;
@@ -195,9 +214,11 @@ export function buildFoldPickerRows(input: BuildFoldPickerRowsInput): FoldPicker
 			},
 		});
 	}
-	const currentPos = positionOf.get(current.entryId) ?? steps.length;
+	// Nothing in progress means every visible step is a row: the round that writes
+	// the fold is a step start after the newest one, so the newest step is foldable.
+	const currentPos = current === undefined ? steps.length : positionOf.get(current.entryId) ?? steps.length;
 	for (const [pos, step] of steps.entries()) {
-		if (pos >= currentPos) continue; // the step you are in has nothing finished after it
+		if (pos >= currentPos) continue; // the step in progress has nothing finished after it
 		if (covered(pos)) continue; // collapsed into a region row
 		const preview = previewOf?.(step) ?? "";
 		const role = roleOf?.(step);

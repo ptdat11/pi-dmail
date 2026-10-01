@@ -136,10 +136,11 @@ export class FoldPickerComponent implements Component {
 	}
 
 	/**
-	 * Phase 1 says what the per-row estimates mean (end = latest). Phase 2 swaps
-	 * that for the pending range and one live figure for it — the row estimates
-	 * alone cannot answer "what would this whole cut cost", and computing every
-	 * pair up front would be an O(n²) walk.
+	 * Phase 1 says what the per-row estimates mean (end = the latest finished
+	 * step, which is the newest one whenever nothing is in progress). Phase 2
+	 * swaps that for the pending range and one live figure for it — the row
+	 * estimates alone cannot answer "what would this whole cut cost", and
+	 * computing every pair up front would be an O(n²) walk.
 	 */
 	private header(): string {
 		const theme = this.theme;
@@ -172,8 +173,8 @@ export class FoldPickerComponent implements Component {
 				this.start = row;
 				this.startIndex = this.selectedIndex;
 				this.phase = "end";
-				// Pre-position the default end: rows are latest first, so index 0 IS
-				// the latest finished step — Enter here gives today's cut.
+				// Pre-position the default end: rows are latest first, so index 0 IS the
+				// latest foldable step — Enter here takes the cut all the way down.
 				this.selectedIndex = 0;
 				return;
 			}
@@ -248,9 +249,13 @@ export class FoldPickerComponent implements Component {
 		const theme = this.theme;
 		const enabled = this.isEndRow(index);
 		const selected = index === this.selectedIndex;
-		// Phase 2 marks the rows that can still be an end with a gutter. The gutter
-		// and not a background, because `selectedBg` is the cursor's signal alone.
-		const gutter = this.phase === "end" && enabled ? theme.fg("muted", "│ ") : "  ";
+		// Phase 2 draws the *pending* range in the gutter, not every reachable end: a
+		// bar from the cursor's row (the end it would name) down to the start row, so
+		// the cut reads as a span that grows and shrinks as the cursor moves. Rows
+		// outside the span keep the reserved two spaces — the column never shifts as
+		// the phase changes, and `selectedBg` is the cursor's signal alone.
+		const inRange = this.phase === "end" && enabled && index <= this.startIndex && index >= this.selectedIndex;
+		const gutter = inRange ? theme.fg("muted", "│ ") : "  ";
 		const cursor = selected ? theme.fg("accent", "› ") : "  ";
 		if (!enabled) return gutter + cursor + theme.fg("dim", row.label);
 		const folded = row.kind === "folded";

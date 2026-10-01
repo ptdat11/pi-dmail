@@ -172,17 +172,30 @@ const OFF_MESSAGE =
 /**
  * `/dmail fold` (and its alias `/send-dmail`) pin a START and an END; this is the
  * prompt that delivers them — idle → plain send, busy → followUp. The agent owns the
- * prose: it writes the summary and performs the fold over exactly that range. When the
- * chosen end is already the last finished step the call goes without `throughStep`,
- * because that is the frozen default (ticket 12).
+ * prose: it writes the summary and performs the fold over exactly that range.
+ *
+ * The call always names `throughStep`. The tool's default end is "the last completed
+ * step", measured when the fold runs — a round after this prompt is read, and a later
+ * round in the same turn moves it further, so it can name a step the user never
+ * pinned. Naming the end is free and cannot drift.
  */
-function foldPinPrompt(fromStep: number, throughStep: number, latestFinishedStep: number): string {
-	const atLatest = throughStep >= latestFinishedStep;
+function foldPinPrompt(
+	fromStep: number,
+	throughStep: number,
+	latestFinishedStep: number,
+	newestAtPinTime: boolean,
+): string {
+	const lead =
+		throughStep < latestFinishedStep
+			? ". "
+			: newestAtPinTime
+				? " — the newest step in view, which folds because the round that folds is the step after it. "
+				: ", the latest finished step. ";
 	return (
 		`The user pinned the cut: fold from step ${fromStep} through step ${throughStep}` +
-		(atLatest ? ", the latest finished step. " : ". ") +
-		`Fold from exactly step ${fromStep} — the user owns the cut point. ` +
-		`Write the summary yourself with send_dmail(fromStep=${fromStep}${atLatest ? "" : `, throughStep=${throughStep}`}, summary) — ` +
+		lead +
+		`Fold from exactly step ${fromStep} and stop exactly at step ${throughStep} — the user owns the cut range. ` +
+		`Write the summary yourself with send_dmail(fromStep=${fromStep}, throughStep=${throughStep}, summary) — ` +
 		`keep everything later steps depend on; tell the user when the fold lands.`
 	);
 }
@@ -336,8 +349,12 @@ interface FoldPlan {
 	target: NumberedStep;
 	/** The inclusive end, exactly as the user or agent chose it. */
 	through: number;
-	/** The first step kept: the exclusive end of the archive and of the fold record. */
-	to: NumberedStep;
+	/**
+	 * The first step kept: the exclusive end of the archive and of the fold record.
+	 * Unset only for an estimate of a cut that ends at the newest step in view while
+	 * nothing is in progress — there is no kept step until the folding round arrives.
+	 */
+	to: NumberedStep | undefined;
 	/** The summary as a fold would record it: trimmed. */
 	summary: string;
 	/** How many fold records replay skipped when the view was planned. */
@@ -346,31 +363,63 @@ interface FoldPlan {
 }
 
 /**
- * The end of a fold, decided once against the live view (ticket 12). `through` is the
- * inclusive end — the caller's choice, or the last finished step by default — and `to`
- * is the first step kept, which is what the fold record's exclusive `toEntryId` reads.
- * Both endpoints are visible step starts, so the record cannot cut a tool call from its
- * result and replay's pairing invariant stays structural. A chosen end that is not a
- * visible finished step (older than the start, or the step you are in) refuses by naming
- * the ends that are valid, in the picker's latest-to-oldest order.
+ * The end of a fold, decided once against the live view (tickets 12 and 13). `through`
+ * is the inclusive end — the caller's choice, or the latest foldable step by default —
+ * and `to` is the first step kept, which is what the fold record's exclusive
+ * `toEntryId` reads. Both endpoints are visible step starts, so the record cannot cut a
+ * tool call from its result and replay's pairing invariant stays structural.
+ *
+ * `inFlight` is the step being written right now, which is never foldable. Omit it when
+ * nothing is running — an idle session, where the newest step is a finished step and
+ * folds, with no step kept after it in this view (`to` is undefined) because the round
+ * that writes the fold has not arrived yet. With a step in flight every legal end is
+ * below it, so `to` always exists: the tool's own fold is written from a round after the
+ * whole view, which makes that case closed by type instead of by a runtime assertion.
+ *
+ * A chosen end that is not foldable (older than the start, or in progress) refuses by
+ * naming the ends that are valid, in the picker's latest-to-oldest order.
  */
 function resolveEnd(
 	visibleSteps: readonly NumberedStep[],
 	target: NumberedStep,
 	throughStep: number | undefined,
-): { to: NumberedStep; through: number } {
-	const current = visibleSteps[visibleSteps.length - 1];
-	if (!current || target.step >= current.step) {
-		throw new Error(`Step ${target.step} is the step you are in, so there is nothing finished to fold yet.`);
+	inFlight: NumberedStep,
+): { to: NumberedStep; through: number };
+function resolveEnd(
+	visibleSteps: readonly NumberedStep[],
+	target: NumberedStep,
+	throughStep: number | undefined,
+	inFlight: undefined,
+): { to: NumberedStep | undefined; through: number };
+function resolveEnd(
+	visibleSteps: readonly NumberedStep[],
+	target: NumberedStep,
+	throughStep: number | undefined,
+	inFlight: NumberedStep | undefined,
+): { to: NumberedStep | undefined; through: number };
+function resolveEnd(
+	visibleSteps: readonly NumberedStep[],
+	target: NumberedStep,
+	throughStep: number | undefined,
+	inFlight: NumberedStep | undefined,
+): { to: NumberedStep | undefined; through: number } {
+	const ends = validEnds(visibleSteps, inFlight, target.step);
+	if (ends.length === 0) {
+		// Only reachable with a step in progress: with none, `target` is a visible step
+		// and is therefore an end of itself.
+		throw new Error(
+			inFlight
+				? `Step ${target.step} is the step you are in, so there is nothing finished to fold yet.`
+				: endRefusal(throughStep ?? target.step, ends),
+		);
 	}
-	const ends = validEnds(visibleSteps, current, target.step);
-	// `target.step < current.step`, so `ends` always holds at least the start itself.
+	// Either the start itself is a legal end, or something newer is.
 	const chosen = throughStep ?? ends[0]!;
 	if (!ends.includes(chosen)) {
 		throw new Error(endRefusal(chosen, ends));
 	}
 	// `to` is the next step in view, which is the first one a fold over this range keeps.
-	const to = visibleSteps.find((step) => step.step > chosen)!;
+	const to = visibleSteps.find((step) => step.step > chosen);
 	return { to, through: chosen };
 }
 
@@ -379,8 +428,11 @@ function resolveEnd(
  * the same errors, and the same estimate. The real fold, the tool's `preview`
  * flag, and `/dmail price` all go through here — that is what makes their
  * numbers identical and their refusals symmetric by construction (ticket 05).
- * Without `throughStep` the end is the last finished step, exactly as before
- * ticket 12.
+ * Without `throughStep` the end is the latest foldable step, exactly as before
+ * ticket 12. `openEnd` says the view has no step in progress, so the newest step is
+ * foldable too — `/dmail price` on an idle session, never the tool, which always runs
+ * inside the round that follows everything in view. Omitting `openEnd` therefore
+ * returns a closed plan: `to` is a step, by type, and not by a runtime assertion.
  */
 function planFold(
 	entries: readonly SessionEntry[],
@@ -389,6 +441,25 @@ function planFold(
 	summary: string,
 	ctx: ExtensionContext,
 	throughStep?: number,
+	openEnd?: false,
+): FoldPlan & { to: NumberedStep };
+function planFold(
+	entries: readonly SessionEntry[],
+	branch: readonly SessionEntry[],
+	fromStep: number,
+	summary: string,
+	ctx: ExtensionContext,
+	throughStep: number | undefined,
+	openEnd: boolean,
+): FoldPlan;
+function planFold(
+	entries: readonly SessionEntry[],
+	branch: readonly SessionEntry[],
+	fromStep: number,
+	summary: string,
+	ctx: ExtensionContext,
+	throughStep?: number,
+	openEnd = false,
 ): FoldPlan {
 	const branchSteps = stepsIn(branch);
 	// Planned before appending: the record this call is about to write is not in
@@ -411,8 +482,14 @@ function planFold(
 
 	// The end is resolved once, here, and frozen. Re-deriving it later would let the
 	// fold keep swallowing every step that follows it, including an end the user chose.
-	const { to, through } = resolveEnd(visibleSteps, target, throughStep);
-
+	// A fold is written from a round that follows everything in view, so the tool reads
+	// that round as the step in flight and its range is closed by type; only the command
+	// side, where nothing is running, may stop at the newest step and keep nothing.
+	if (openEnd) {
+		const open = resolveEnd(visibleSteps, target, throughStep, undefined);
+		return estimateFold(entries, target, open.to, open.through, trimmed, skipped.length, ctx);
+	}
+	const { to, through } = resolveEnd(visibleSteps, target, throughStep, visibleSteps[visibleSteps.length - 1]);
 	return estimateFold(entries, target, to, through, trimmed, skipped.length, ctx);
 }
 
@@ -425,7 +502,7 @@ function planFold(
 function estimateFold(
 	entries: readonly SessionEntry[],
 	target: NumberedStep,
-	to: NumberedStep,
+	to: NumberedStep | undefined,
 	through: number,
 	summary: string,
 	skipped: number,
@@ -451,20 +528,27 @@ function estimateFold(
 	// rewrite) starts at `end`. Both walks use replay's convert() so the
 	// counts match what replay sends.
 	let archiveTokens = 0;
-	let keptAfterTokens: number | null = 0;
+	let keptTokens = 0;
+	// Without a kept step the cut runs to the newest step in view, and what follows it is
+	// the round that folds — not in this view. The kept suffix is then unknown rather
+	// than zero: "nothing after the cut" is a promise this estimate does not get to make.
+	// The archive is under-counted by the same step (the pin prompt and the folding
+	// round arrive after this view), which is why the figure is advisory, not a bill.
+	let keptKnown = to !== undefined;
 	try {
 		const start = entries.findIndex((entry) => entry.id === target.entryId);
-		const end = entries.findIndex((entry) => entry.id === to.entryId);
+		const end = to === undefined ? entries.length : entries.findIndex((entry) => entry.id === to.entryId);
 		if (start < 0 || end < start) throw new Error("fold range not in the view");
 		const tokensOf = (entry: SessionEntry): number =>
 			sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateTokens(message), 0);
 		for (const entry of entries.slice(start, end)) archiveTokens += tokensOf(entry);
-		for (const entry of entries.slice(end)) keptAfterTokens += tokensOf(entry);
+		for (const entry of entries.slice(end)) keptTokens += tokensOf(entry);
 	} catch {
 		// A malformed entry can hide tokens: the verdict degrades, the fold does not.
 		archiveTokens = 0;
-		keptAfterTokens = null;
+		keptKnown = false;
 	}
+	const keptAfterTokens: number | null = keptKnown ? keptTokens : null;
 	// The memo as replay sends it: wrapSummary's <summary> wrapper is part of
 	// what replaces the archive, so it is part of what the replacement costs.
 	const memoTokens = estimateTokens(userMessage(wrapSummary(summary), Date.now()));
@@ -507,11 +591,14 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 	const summaryText = words.slice(endToken === undefined ? 1 : 2).join(" ").trim();
 
 	if (stepToken === undefined) {
-		// Every candidate cut: a visible step with at least one finished step after it.
+		// Every candidate cut: a step that can start a range, latest first. With nothing
+		// in progress the newest step starts one too, ending on itself.
 		const visibleSteps = visibleStepsOf(entries, branch);
-		const current = visibleSteps[visibleSteps.length - 1];
-		const candidates = current ? visibleSteps.filter((step) => step.step < current.step).reverse() : [];
-		if (!current || candidates.length === 0) {
+		const inFlight = ctx.isIdle() ? undefined : visibleSteps[visibleSteps.length - 1];
+		const candidates = visibleSteps
+			.filter((step) => inFlight === undefined || step.step < inFlight.step)
+			.reverse();
+		if (candidates.length === 0) {
 			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
 			return;
 		}
@@ -520,7 +607,7 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 		// headline and the figures describe the cut that would actually happen — not an
 		// arithmetic guess a folded-away step turns into a step that is not there.
 		const plans = candidates.map((target) => {
-			const end = resolveEnd(visibleSteps, target, undefined);
+			const end = resolveEnd(visibleSteps, target, undefined, inFlight);
 			return estimateFold(entries, target, end.to, end.through, PRICE_SUMMARY_SAMPLE, skipped.length, ctx);
 		});
 		const rows = plans.map(
@@ -559,6 +646,9 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 			summaryText === "" ? PRICE_SUMMARY_SAMPLE : summaryText,
 			ctx,
 			endToken === undefined ? undefined : Number(endToken),
+			// On an idle session the newest step is a finished step, so pricing it means
+			// pricing the cut the picker offers — the fold that follows it is the kept step.
+			ctx.isIdle(),
 		);
 		const details = {
 			fromStep: plan.target.step,
@@ -667,7 +757,13 @@ export default function dmail(pi: ExtensionAPI): void {
 			ctx.ui.notify("Nothing to fold yet — no steps in view.", "warning");
 			return;
 		}
-		const current = visible[visible.length - 1];
+		// The newest step is the round in progress only while something is running. On an
+		// idle session it is a finished step like any other — and the round that writes
+		// the fold will be a step start after it — so it is offered at both ends.
+		const inFlight = ctx.isIdle() ? undefined : visible[visible.length - 1];
+		// The end a pin takes when the user chose only a start. Read off the view, because
+		// step numbers keep their gaps once steps are folded away.
+		const latestFinished = latestFinishedStep(visible, inFlight);
 		const plan = planForView(entries, branch);
 		const entryById = new Map(entries.map((entry) => [entry.id, entry]));
 		// One pricing walk per (start, end) pair, memoised: the picker asks for a row's
@@ -679,7 +775,9 @@ export default function dmail(pi: ExtensionAPI): void {
 			const target = visible.find((step) => step.step === fromStep);
 			const to = visible.find((step) => step.step > throughStep);
 			let line: string | undefined;
-			if (target && to) {
+			// No step kept after the cut is legal only when nothing is in flight: the cut
+			// then runs to the newest step, whose fold has not arrived in this view yet.
+			if (target && (to !== undefined || inFlight === undefined)) {
 				const range = estimateFold(entries, target, to, throughStep, PRICE_SUMMARY_SAMPLE, plan.skipped.length, ctx);
 				line = estimateLine(range.economics.removedTokens);
 			}
@@ -688,16 +786,13 @@ export default function dmail(pi: ExtensionAPI): void {
 		};
 		// The ends a fold from this start may stop at, latest first — the very list the
 		// fold's own endpoint validation reads, so a refusal never names a refused step.
-		const endsFrom = (fromStep: number): number[] => validEnds(visible, current, fromStep);
+		const endsFrom = (fromStep: number): number[] => validEnds(visible, inFlight, fromStep);
 		// A number to suggest when an end was missing or unparseable: the end this start
-		// would have taken by default, or the latest finished step if it has none.
+		// would have taken by default, or the latest foldable step if it has none.
 		const endsHint = (fromStep: number): number => endsFrom(fromStep)[0] ?? latestFinished;
-		// The end a pin takes when the user chose only a start. Read off the view, because
-		// step numbers keep their gaps once steps are folded away.
-		const latestFinished = latestFinishedStep(visible, current);
 		const rows = buildFoldPickerRows({
 			steps: visible,
-			current,
+			current: inFlight,
 			folds: plan.inEra,
 			roleOf: (step) => entryRole(entryById.get(step.entryId)),
 			previewOf: (step) => foldSummaryPreview(entryText(entryById.get(step.entryId))),
@@ -712,7 +807,7 @@ export default function dmail(pi: ExtensionAPI): void {
 		const pin = (fromStep: number, throughStep: number): void => {
 			pinned = { fromStep, throughStep };
 			const cut = foldBracket(fromStep, throughStep);
-			const prompt = foldPinPrompt(fromStep, throughStep, latestFinished);
+			const prompt = foldPinPrompt(fromStep, throughStep, latestFinished, inFlight === undefined);
 			if (ctx.isIdle()) {
 				pi.sendUserMessage(prompt);
 				ctx.ui.notify(`Pinned ${cut} — the agent will fold and write the summary.`, "info");
@@ -788,7 +883,7 @@ export default function dmail(pi: ExtensionAPI): void {
 			// the full list again; esc in the start dialog is the only way out.
 			for (;;) {
 				const startLabel = await ctx.ui.select(
-					`${PICKER_TITLE} The step you are in is kept. ${ESTIMATE_LEGEND}.`,
+					`${PICKER_TITLE} The end is the latest finished step. ${ESTIMATE_LEGEND}.`,
 					rows.map((row) => row.label),
 				);
 				const startRow = startLabel === undefined ? undefined : rows.find((row) => row.label === startLabel);
@@ -1024,6 +1119,9 @@ export default function dmail(pi: ExtensionAPI): void {
 			const branch = ctx.sessionManager.getBranch();
 			const plan = planFold(entries, branch, params.fromStep, params.summary, ctx, params.throughStep);
 			const { target, to, through, economics, summary: trimmedSummary, skipped } = plan;
+			// `to` is typed as present, and the tool never passes `openEnd`: the newest
+			// step in view is the round running this very call, so a step always follows
+			// the cut — which is what keeps a tool call and its result on one side of it.
 
 			// Skipped records are counted, never dropped silently: the count rides the
 			// result so every view of it (raw fallback, collapsed, expanded) can say so.
@@ -1072,10 +1170,19 @@ export default function dmail(pi: ExtensionAPI): void {
 			});
 
 			// A fold over the range the user pinned through `/dmail fold` says so in the
-			// confirmation, naming the range; any real fold consumes the pin, so it can
-			// only ever describe one fold (ticket 07: "folded on their behalf").
-			const behalf = pinned?.fromStep === target.step ? ` Folded on your behalf ${foldBracket(target.step, through)}.` : "";
-			pinned = undefined;
+			// confirmation — but only when the fold really is that range. The end has to
+			// match too: the default end moves when a fold lands a round later than the
+			// pin, and a wider fold must not be reported as one the user asked for.
+			const behalf =
+				pinned?.fromStep === target.step && pinned.throughStep === through
+						? ` Folded on your behalf ${foldBracket(target.step, through)}.`
+						: "";
+			// The pin survives a fold that was not it: the injected policy tells the agent
+			// to fold finished work as soon as it lands, so it may well fold something
+			// else before the range the user pinned. A lingering pin can only ever credit
+			// that exact range, and crediting it twice is unreachable — its own start is
+			// gone once it has folded.
+			if (behalf !== "") pinned = undefined;
 			// Best effort: a fold that succeeded must not be reported as a failure just
 			// because the front end could not draw a notification.
 			try {

@@ -61,7 +61,7 @@ is finished. What you get is a status badge and two commands:
 | --- | --- |
 | Blue `D-MAIL ON` / red `⚠ D-MAIL OFF` badge | Whether folding is active, shown in the footer. |
 | `/dmail` | Toggle folding for the session. Also `/dmail on`, `/dmail off`, `/dmail status`, `/dmail fold`, `/dmail price`. |
-| `/dmail fold` | The user owns the cut **range**. Opens a two-phase picker over one stable, latest-first list: enter picks the **start**, enter again picks the **end** (inclusive, defaulted to the latest finished step — so Enter,Enter is the old one-cut behavior), `esc` in phase 2 returns to phase 1, `esc` in phase 1 cancels. The pending range shows as `[A - B]` with its live `~ ≈` figure in the header while the end is picked; rows older than the start are dimmed and the cursor cannot reach them. `Enter` on a folded `[a - b]` region folds the whole region in. The agent is then told the pinned range and writes the summary. Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
+| `/dmail fold` | The user owns the cut **range**. Opens a two-phase picker over one stable, latest-first list: enter picks the **start**, enter again picks the **end** (inclusive, defaulted to the latest finished step — so Enter,Enter is the old one-cut behavior), `esc` in phase 2 returns to phase 1, `esc` in phase 1 cancels. The pending range shows as `[A - B]` with its live `~ ≈` figure in the header while the end is picked; rows older than the start are dimmed and the cursor cannot reach them. `Enter` on a folded `[a - b]` region folds the whole region in. When nothing is running — you typed the command, the agent is waiting — the **newest** step is on the list too, at either end: the turn that does the folding will be a step after it, so folding it loses nothing you still need. While the agent is mid-turn that step stays off the list, because it is the round executing your request. The agent is then told the pinned range and writes the summary. Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
 | `/send-dmail` | Alias of `/dmail fold`: opens the picker to pin the range the agent folds (`/send-dmail 2` pins a start, `/send-dmail 2 7` the whole range, no picker needed). Refused when folding is off, `send_dmail` isn't an active tool, or nothing is in view. |
 | `--dmail-disabled` | Force folding off for one session, overriding settings (`/dmail` turns it back on). |
 | `dmail.enabled` in `settings.json` | Default mode for new sessions (`false` starts them off). |
@@ -109,7 +109,9 @@ injected policy are a floor, not a schedule. Four habits shape the timing, and a
   summary. `/dmail price [start] [end] [summary…]` — a second number is the inclusive end — is the
   read-only command form of the same check. These numbers
   are advisory — a prediction from the session's own cache behaviour, not a promise — but they are the
-  cheap way to see a cut before making it.
+  cheap way to see a cut before making it. One of them is a deliberate blank: a cut that runs to the
+  newest step says its rebuild is unknowable, because what follows it is the turn that will do the
+  folding, and that turn is not in view yet.
 - **The user can pin the cut range.** `/dmail fold` (alias `/send-dmail`) opens a picker listing candidate
   cuts with their headline figures, so you choose both ends of the rung instead of waiting for the
   agent: enter sets the start, enter again sets the end, and the header prices the pending `[A - B]` while

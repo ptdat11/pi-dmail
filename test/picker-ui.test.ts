@@ -202,7 +202,7 @@ test("the (start, end) memo never re-asks the host for a pair it already priced"
 	assert.equal(calls.length, 4, "returning to a priced pair reuses the memo");
 });
 
-test("in phase 2 invalid ends are dimmed, valid ends carry a gutter, and the cursor never visits a dimmed row", () => {
+test("in phase 2 invalid ends are dimmed, the pending range carries the gutter, and the cursor never visits a dimmed row", () => {
 	const { component } = make(stepRows(6), 12, () => "~1k");
 	pinStart(component, 4); // rows: 6,5,4 | 3,2,1 — the last three are older than the start
 
@@ -215,7 +215,9 @@ test("in phase 2 invalid ends are dimmed, valid ends carry a gutter, and the cur
 	const invalid = rowLines.filter((line) => "123".includes(stepOf(line)));
 	assert.equal(valid.length, 3);
 	assert.equal(invalid.length, 3);
-	for (const line of valid) assert.ok(line.includes("<muted:│ >"), `gutter on a valid end: ${line}`);
+	// The cursor opens on the default end (row 0), so the pending range is 6..4 and
+	// the gutter spans those three rows — not merely "every reachable end".
+	for (const line of valid) assert.ok(line.includes("<muted:│ >"), `gutter on the pending range: ${line}`);
 	for (const line of invalid) {
 		assert.ok(!line.includes("│"), `no gutter on an invalid end: ${line}`);
 		assert.match(line, /<dim:\d+  assistant: peek \d+  ~4\.8k>/, "the whole invalid row is dimmed");
@@ -223,11 +225,18 @@ test("in phase 2 invalid ends are dimmed, valid ends carry a gutter, and the cur
 
 	const selected = rowLines.filter((line) => line.includes("<bg-selectedBg:"));
 	assert.equal(selected.length, 1, "the background belongs to the cursor alone");
-	assert.ok(selected[0].includes("<muted:│ >"), "the cursor row is a valid end");
+	assert.ok(selected[0].includes("<muted:│ >"), "the cursor row is inside the range");
 	assert.ok(!invalid.some((line) => line.includes("›")), "a dimmed row can never carry the cursor");
 
+	// The gutter is the range, so it follows the cursor down to the start row.
+	component.handleInput(DOWN);
+	const moved = component.render(120).filter((line) => line.includes("peek"));
+	assert.ok(moved[0].includes("peek 6") && !moved[0].includes("│"), "step 6 is now above the cut: no gutter");
+	assert.ok(moved[1].includes("<muted:│ >"), "the cursor row stays in the range");
+	assert.ok(moved[2].includes("<muted:│ >"), "the start row closes the range");
+
 	// ↓ stops at the start row, which is itself a valid end (A == B is legal).
-	for (let i = 0; i < 5; i++) component.handleInput(DOWN);
+	for (let i = 0; i < 4; i++) component.handleInput(DOWN);
 	assert.equal(component.state.cursor, 2, "the cursor stops on the start row, not on the dimmed rows");
 	assert.match(component.render(120).join("\n"), /\(3\/6\)/, "footer counter unchanged in phase 2");
 	assert.deepEqual(component.pending, { fromStep: 4, throughStep: 4 }, "A == B is a legal single-step fold");

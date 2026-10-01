@@ -12,6 +12,29 @@ import {
 	evaluateEconomics,
 } from "../economics.ts";
 
+test("an unknowable kept-suffix degrades the cache verdict instead of assuming an empty one", () => {
+	// A cut that runs to the newest step in view (ticket 13): what follows it is the round
+	// that will write the fold, which is not in this view. `keptAfterTokens: null` says
+	// that; pricing it as zero would promise a rebuild of the memo alone and a fast
+	// break-even the fold will not actually have.
+	const e = evaluateEconomics({
+		archiveTokens: 50_000,
+		memoTokens: 2_000,
+		keptAfterTokens: null,
+		contextTokens: 60_000,
+		contextWindow: 160_000,
+		reserveTokens: 16_384,
+	});
+
+	assert.equal(e.removedTokens, 48_000, "the archive is still measured");
+	assert.equal(e.estimatedSavingsTokens, 4_800, "so is the saving it buys per request");
+	assert.equal(e.rebuildTokens, null, "the rebuild cannot be priced from this view");
+	assert.equal(e.breakEvenRequests, null, "and so break-even has no number to report");
+	assert.equal(e.cacheVerdict, "unknown", "the verdict says unknown instead of guessing");
+	// Nothing is gated on it: the fold proceeds and the advisory still rides along.
+	assert.equal(e.verdict, "savings");
+});
+
 test("savings verdict: archive far larger than memo, rebuild pays back fast", () => {
 	const e = evaluateEconomics({
 		archiveTokens: 50_000,
