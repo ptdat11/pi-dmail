@@ -57,8 +57,10 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
+	archivedSpanOf,
 	FOLD_TYPE,
 	foldContext,
+	isArchivedMidStart,
 	numberSteps,
 	planReplay,
 	wrapSummary,
@@ -344,6 +346,47 @@ function visibleStepsOf(entries: readonly SessionEntry[], branch: readonly Sessi
 	return stepsIn(branch).filter((step) => visible.has(step.entryId));
 }
 
+/**
+ * Refuse a fold that starts inside an already-folded span, naming the marker that
+ * absorbs the existing summary instead (tickets 12 and 14). The record would be
+ * well-formed but its start would not contain the old fold's start, so suppression
+ * would leave the old memo standing and place a second, overlapping one beside it.
+ * A picker row can never trigger this — a region row starts where its summary
+ * starts — so this is the guard on what the agent or a typed range asks for.
+ */
+function midStartRefusal(
+	entries: readonly SessionEntry[],
+	branchSteps: readonly NumberedStep[],
+	inEra: readonly FoldRecord[],
+	target: NumberedStep,
+): string | undefined {
+	const positionOf = new Map(entries.map((entry, i) => [entry.id, i]));
+	const targetPos = positionOf.get(target.entryId);
+	if (targetPos === undefined) return undefined;
+	const spans: (readonly [number, number])[] = [];
+	let enclosing: FoldRecord | undefined;
+	for (const fold of inEra) {
+		const from = positionOf.get(fold.fromEntryId);
+		const to = positionOf.get(fold.toEntryId);
+		if (from === undefined || to === undefined) continue;
+		spans.push([from, to]);
+		enclosing ??= isArchivedMidStart(targetPos, [[from, to]]) ? fold : undefined;
+	}
+	const span = archivedSpanOf(targetPos, spans);
+	if (span === undefined || enclosing === undefined) return undefined;
+	const stepAt = new Map(branchSteps.map((step) => [step.entryId, step]));
+	// The last step the fold archives is the step before its `to` entry, which is a
+	// step start by the pairing invariant, so there is always one to name.
+	const start = stepAt.get(enclosing.fromEntryId);
+	const through = branchSteps.filter((step) => step.index < (positionOf.get(enclosing!.toEntryId) ?? Infinity)).at(-1);
+	if (!start || !through) return undefined;
+	return (
+		`Step ${target.step} is inside a fold that already covers steps ${start.step} – ${through.step}. ` +
+		`Fold from step ${start.step} instead: that is the marker of the summary to absorb, ` +
+		`whereas folding from inside it would leave both summaries standing.`
+	);
+}
+
 /** A fold fully decided: the validated range, the trimmed summary, its estimate. */
 interface FoldPlan {
 	target: NumberedStep;
@@ -464,7 +507,8 @@ function planFold(
 	const branchSteps = stepsIn(branch);
 	// Planned before appending: the record this call is about to write is not in
 	// the `entries` snapshot, so reading it here would miscount it as orphaned.
-	const { skipped } = planForView(entries, branch);
+	const plan = planForView(entries, branch);
+	const { skipped } = plan;
 	const visibleSteps = visibleStepsOf(entries, branch);
 	const listed = visibleSteps.map((step) => step.step).join(", ") || "none";
 
@@ -474,6 +518,10 @@ function planFold(
 	}
 	if (!visibleSteps.some((step) => step.entryId === target.entryId)) {
 		throw new Error(`Step ${fromStep} has already been folded out of view. Visible steps: [${listed}].`);
+	}
+	const midStart = midStartRefusal(entries, branchSteps, plan.inEra, target);
+	if (midStart !== undefined) {
+		throw new Error(midStart);
 	}
 	const trimmed = summary.trim();
 	if (trimmed === "") {

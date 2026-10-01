@@ -429,8 +429,10 @@ test("the agent folds from exactly the pinned step and the user is told", async 
 		),
 		"the user gets confirmation naming the range that was folded on their behalf",
 	);
-	// The pin is consumed: only the fold it describes is credited to it.
-	await h.execute({ fromStep: 3, summary: "a later, unpinned fold" });
+	// The pin is consumed: only the fold it describes is credited to it. A second fold
+	// re-folds the same start (a legal re-fold — it must start at the first fold's start,
+	// not inside it) to show the pin is not carried over.
+	await h.execute({ fromStep: 1, summary: "a later, unpinned fold of the same range" });
 	assert.doesNotMatch(
 		h.ui.notifications.at(-1)?.message ?? "",
 		/on your behalf/,

@@ -161,29 +161,65 @@ test("a partial re-fold keeps summaries the newer range does not contain", () =>
 	]);
 });
 
-test("overlap without containment renders both summaries unchanged", () => {
-	// The re-fold starts inside the older fold's region but does not reach back
-	// to the older start, so nothing is suppressed.
-	const folds = [rec("a1", "a4", "S1", 1), rec("a3", "a4", "S3", 3)];
-	assert.deepEqual(render(ladder(), folds), ["u1", "[step 1]", "<S1>", "[step 3]", "<S3>", "[step 4]", "a4"]);
-	assertPaired(ladder(), folds);
+test("a fold that starts inside an older region's span is skipped, and the older summary is left intact", () => {
+	// The re-fold starts strictly inside the older fold's span and does not reach back
+	// to the older start, so suppression could never reach it: applying it would leave
+	// two overlapping summaries side by side. It is skipped and counted instead.
+	const outer = rec("a1", "a4", "S1", 1);
+	const inner = rec("a3", "a4", "S3", 3);
+	const result = run(ladder(), [outer, inner]);
+
+	assert.deepEqual(result.applied, [outer], "only the outer fold takes effect");
+	assert.deepEqual(result.skipped, [{ fold: inner, why: "start-inside-archived-span" }]);
+	assert.deepEqual(
+		result.messages,
+		["u1", "[step 1]", "<S1>", "[step 4]", "a4"],
+		"the outer summary renders alone: one memo, no second one beside it",
+	);
+	assertPaired(ladder(), [outer, inner]);
 });
 
-test("a re-fold whose start is inside an older region still renders both", () => {
-	// The tool-level scenario from the ticket: fold steps 1–2, then re-fold from
-	// step 2. The older start (step 1) is not contained by [step 2, end), so both
-	// summaries survive.
-	const folds = [rec("a1", "a3", "S1", 1), rec("a2", "a4", "S2 prime", 2)];
-	assert.deepEqual(render(ladder(), folds), [
-		"u1",
-		"[step 1]",
-		"<S1>",
-		"[step 2]",
-		"<S2 prime>",
-		"[step 4]",
-		"a4",
-	]);
-	assertPaired(ladder(), folds);
+test("a fold that starts inside an older region is skipped, not applied (steps 1–2 then from step 2)", () => {
+	// The tool-level scenario from ticket 14: fold steps 1–2, then a record whose start
+	// is step 2's entry, inside the first fold's span. Refused at the tool; here the
+	// algebra shows what replay would do with such a record if it reached it anyway.
+	const outer = rec("a1", "a3", "S1", 1);
+	const inner = rec("a2", "a4", "S2 prime", 2);
+	const result = run(ladder(), [outer, inner]);
+
+	assert.deepEqual(result.applied, [outer]);
+	assert.deepEqual(result.skipped, [{ fold: inner, why: "start-inside-archived-span" }]);
+	assert.deepEqual(
+		result.messages,
+		["u1", "[step 1]", "<S1>", "[step 3]", "a3", "r3", "u4", "[step 4]", "a4"],
+		"the newer summary is not written beside the older one; the outer fold's kept step still shows",
+	);
+	assertPaired(ladder(), [outer, inner]);
+});
+
+test("planReplay counts the same mid-span records foldContext skips, so the count is honest", () => {
+	const entries = ladder();
+	const outer = { ...rec("a1", "a3", "S1", 1), holderEntryId: "a4" };
+	const inner = { ...rec("a2", "a4", "S2 prime", 2), holderEntryId: "a4" };
+	const plan = planReplay(entries, [outer, inner], { isStepStart: (entry) => entry.kind === "step" });
+
+	assert.deepEqual(plan.inEra, [outer], "only the outer fold is in era");
+	assert.deepEqual(plan.skipped, [{ fold: inner, why: "start-inside-archived-span" }]);
+});
+
+test("a same-start re-fold absorbs the older summary, so a fold reaching the region start is never mid-span", () => {
+	// The climb the policy asks for: start at the enclosing summary's own step.
+	const older = rec("a1", "a3", "S1", 1);
+	const newer = rec("a1", "a4", "S1 and S2 together", 1);
+	const result = run(ladder(), [older, newer]);
+
+	assert.deepEqual(result.applied, [older, newer], "starting at a summary's start is a legal re-fold");
+	assert.deepEqual(result.skipped, []);
+	assert.deepEqual(
+		result.messages,
+		["u1", "[step 1]", "<S1 and S2 together>", "[step 4]", "a4"],
+		"one summary at that start: the older memo is replaced, not stacked",
+	);
 });
 
 test("same start: the newest summary wins", () => {

@@ -74,6 +74,7 @@ export interface SkippedFold {
 		| "end-not-after-start"
 		| "start-not-a-step-boundary"
 		| "end-not-a-step-boundary"
+		| "start-inside-archived-span"
 		| "record-out-of-era";
 }
 
@@ -155,10 +156,38 @@ function indexPositions<E extends EntryLike>(entries: readonly E[]): Map<string,
 }
 
 /**
+ * True when `from` falls inside an already-folded span without being that fold's
+ * own start (tickets 12 and 14).
+ *
+ * Such a fold is well-formed but pointless: summary suppression replaces an older
+ * memo by *containing its start*, so a fold starting mid-span leaves the old memo
+ * standing and puts a second, overlapping summary next to it — the transcript it
+ * claims to absorb is still there, described twice. Folding from the enclosing
+ * summary's start instead absorbs it, which is what the caller (and the policy)
+ * means by climbing. Starting exactly at an earlier fold's start is a legal
+ * re-fold — newest wins — and is not caught here.
+ *
+ * `archivedSpanOf` is the same decision with the offending span handed back, so a
+ * caller can name it in a refusal instead of re-deriving which fold it was.
+ */
+export function archivedSpanOf(
+	from: number,
+	spans: readonly (readonly [number, number])[],
+): readonly [number, number] | undefined {
+	return spans.find(([spanFrom, spanTo]) => from > spanFrom && from < spanTo);
+}
+
+export function isArchivedMidStart(from: number, spans: readonly (readonly [number, number])[]): boolean {
+	return archivedSpanOf(from, spans) !== undefined;
+}
+
+/**
  * Validate one record against a positional view of the entries.
  *
  * Shared by `foldContext` (replay) and `planReplay` (era split), so a record
  * rejected in one place is rejected in the other for exactly the same reason.
+ * `archived` is the [from, to) of the folds already applied, in order, so the
+ * mid-span check sees the same earlier folds both callers do.
  * Returns the start and end indices on success, or the reason it did not take
  * effect.
  */
@@ -167,6 +196,7 @@ function validateFold<E extends EntryLike>(
 	positionOf: ReadonlyMap<string, number>,
 	entries: readonly E[],
 	isStepStart?: (entry: E) => boolean,
+	archived: readonly (readonly [number, number])[] = [],
 ): { from: number; to: number; why: null } | { from: null; to: null; why: SkippedFold["why"] } {
 	if (typeof fold?.summary !== "string" || fold.summary.trim() === "") {
 		return { from: null, to: null, why: "blank-summary" };
@@ -181,6 +211,9 @@ function validateFold<E extends EntryLike>(
 	}
 	if (isStepStart && !isStepStart(entries[to] as E)) {
 		return { from: null, to: null, why: "end-not-a-step-boundary" };
+	}
+	if (isArchivedMidStart(from, archived)) {
+		return { from: null, to: null, why: "start-inside-archived-span" };
 	}
 	return { from, to, why: null };
 }
@@ -213,18 +246,22 @@ export function planReplay<E extends EntryLike>(
 	const positionOf = indexPositions(entries);
 	const inEra: FoldRecord[] = [];
 	const skipped: SkippedFold[] = [];
+	// Applied spans in order, so a record that starts inside an earlier one is
+	// judged exactly as replay will judge it (ticket 14).
+	const archived: (readonly [number, number])[] = [];
 
 	for (const fold of folds) {
 		if (!positionOf.has(fold.holderEntryId)) {
 			skipped.push({ fold, why: "record-out-of-era" });
 			continue;
 		}
-		const check = validateFold(fold, positionOf, entries, options.isStepStart);
+		const check = validateFold(fold, positionOf, entries, options.isStepStart, archived);
 		if (check.why !== null) {
 			skipped.push({ fold, why: check.why });
 			continue;
 		}
 		inEra.push(fold);
+		archived.push([check.from, check.to]);
 	}
 
 	return { inEra, skipped };
@@ -251,9 +288,12 @@ export function foldContext<E extends EntryLike, M>(
 	const dropped = new Set<number>();
 	const applied: FoldRecord[] = [];
 	const skipped: SkippedFold[] = [];
+	// Applied spans in order: a record starting inside one is the mid-span case
+	// (ticket 14) — it would leave the earlier summary standing beside its own.
+	const archived: (readonly [number, number])[] = [];
 
 	for (const fold of folds) {
-		const check = validateFold(fold, positionOf, entries, options.isStepStart);
+		const check = validateFold(fold, positionOf, entries, options.isStepStart, archived);
 		if (check.why !== null) {
 			skipped.push({ fold, why: check.why });
 			continue;
@@ -268,6 +308,7 @@ export function foldContext<E extends EntryLike, M>(
 		summaryAt.set(from, { text: wrapSummary(fold.summary), fold });
 		for (let i = from; i < to; i++) dropped.add(i);
 		applied.push(fold);
+		archived.push([from, to]);
 	}
 
 	const messages: M[] = [];

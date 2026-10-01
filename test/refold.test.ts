@@ -39,53 +39,54 @@ function summaryCount(messages: readonly string[]): number {
 	return messages.reduce((n, text) => n + (text.match(/<summary>/g)?.length ?? 0), 0);
 }
 
-test("a re-fold from a start inside an existing fold region succeeds", async () => {
+test("a re-fold from a start inside an existing fold region is refused, naming the marker that absorbs it", async () => {
 	const h = await createHarness();
 	await h.start();
 
 	const first = await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
 	assertFoldDetails(first, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
 
-	// Step 2's assistant is already folded away; the tool must still accept it.
-	const second = await h.execute({ fromStep: 2, summary: "S2 covers step 2" });
-	const secondDetails = assertFoldDetails(second, {
-		fromStep: 2,
-		throughStep: 2,
-		fromEntryId: "e4",
-		toEntryId: "e6",
-	});
-
+	// Step 2's assistant is already folded away. Starting there would leave S1 standing
+	// beside a second summary covering the same transcript, so the fold refuses and
+	// points at step 1 — the marker of the summary to absorb.
+	await assert.rejects(
+		h.execute({ fromStep: 2, summary: "S2 covers step 2" }),
+		/inside a fold that already covers steps 1 – 2\. Fold from step 1 instead/,
+	);
 	assert.deepEqual(
 		h.pi.appended.map((entry) => entry.customType),
-		[FOLD_TYPE, FOLD_TYPE],
-		"both fold records were appended",
+		[FOLD_TYPE],
+		"a refused fold appends nothing",
 	);
-	assert.deepEqual(h.pi.appended[1].data, {
-		fromEntryId: "e4",
-		toEntryId: "e6",
-		summary: "S2 covers step 2",
-		fromStep: 2,
-		predicted: secondDetails.predicted,
-		actual: null,
-	});
+
+	// Climbing to that marker folds: the new summary replaces S1 instead of stacking on it.
+	const climbed = await h.execute({ fromStep: 1, throughStep: 2, summary: "S1 and S2 together" });
+	assertFoldDetails(climbed, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const messages = await contextMessages(h);
+	assert.equal(summaryCount(messages), 1, "the older memo is replaced, not left beside the new one");
+	assert.ok(messages.some((text) => text.includes("S1 and S2 together")));
+	assert.ok(!messages.some((text) => text.includes("S1 covers steps 1-2")), "the absorbed memo is gone from the view");
+
+	// The surviving step keeps its branch number; folding never renumbers it.
+	const lastKept = messages.findIndex((text) => text.includes("third answer"));
+	assert.ok(lastKept > 0, "the step you are in is still rendered");
+	assert.match(messages[lastKept - 1], /^\[step 3\]$/);
 });
 
 test("stacked re-folds render each surviving summary with its original step marker", async () => {
 	const h = await createHarness();
 	await h.start();
-	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
-	await h.execute({ fromStep: 2, summary: "S2 covers step 2" });
+	await h.execute({ fromStep: 1, summary: "S1 covers step 1" });
+	await h.execute({ fromStep: 1, summary: "S1 covers step 1, tightened" });
 
-	// Overlap without containment: the second range does not reach back to step
-	// 1's start, so both summaries survive — each with the fold's own step marker.
+	// Same-start re-folds: newest wins at that start, and the step's own marker is
+	// unchanged, because numbers never renumber.
 	const messages = await contextMessages(h);
-	assert.equal(summaryCount(messages), 2);
+	assert.equal(summaryCount(messages), 1);
 
-	const firstSummary = messages.findIndex((text) => text.includes("S1 covers steps 1-2"));
-	const secondSummary = messages.findIndex((text) => text.includes("S2 covers step 2"));
-	assert.ok(firstSummary > 0 && secondSummary > firstSummary, "both summaries rendered, in order");
-	assert.match(messages[firstSummary - 1], /^\[step 1\]$/);
-	assert.match(messages[secondSummary - 1], /^\[step 2\]$/);
+	const summaryAt = messages.findIndex((text) => text.includes("S1 covers step 1, tightened"));
+	assert.ok(summaryAt > 0, "the newest summary renders");
+	assert.match(messages[summaryAt - 1], /^\[step 1\]$/, "the summary keeps the step it starts at");
 
 	// The surviving step keeps its branch number; folding never renumbers it.
 	const lastKept = messages.findIndex((text) => text.includes("third answer"));
@@ -112,10 +113,10 @@ test("/dmail off hands back the full raw transcript after stacked re-folds", asy
 	const h = await createHarness();
 	await h.start();
 	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
-	await h.execute({ fromStep: 2, summary: "S2 covers step 2" });
+	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2, tightened" });
 
 	const folded = await contextMessages(h);
-	assert.equal(summaryCount(folded), 2);
+	assert.equal(summaryCount(folded), 1);
 	assert.ok(!folded.some((text) => text.includes("first answer")), "folded material is out of the view");
 
 	// Nothing was deleted: the original six entries still sit, in order, untouched.
@@ -133,20 +134,20 @@ test("/dmail off hands back the full raw transcript after stacked re-folds", asy
 
 	await h.runCommand("dmail", "on");
 	const restored = await contextMessages(h);
-	assert.equal(summaryCount(restored), 2, "re-enabling replays the records");
+	assert.equal(summaryCount(restored), 1, "re-enabling replays the records");
 	assert.ok(!restored.some((text) => text.includes("first answer")), "folded steps stay folded while enabled");
 
-	// A third stacked re-fold (same start as the second) toggles just as cleanly.
-	await h.execute({ fromStep: 2, summary: "S2, tightened" });
+	// A third stacked re-fold (same start again) toggles just as cleanly.
+	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2, twice over" });
 	const stacked = await contextMessages(h);
-	assert.equal(summaryCount(stacked), 2, "the third fold replaced the second summary; S1 untouched");
-	assert.ok(stacked.some((text) => text.includes("S2, tightened")));
-	assert.ok(!stacked.some((text) => text.includes("S2 covers step 2")));
+	assert.equal(summaryCount(stacked), 1, "each re-fold replaced the summary at that start");
+	assert.ok(stacked.some((text) => text.includes("twice over")));
+	assert.ok(!stacked.some((text) => text.includes("tightened")));
 
 	await h.runCommand("dmail", "off");
 	assert.equal(await dispatchContext(h), undefined, "raw again after three stacked folds");
 	await h.runCommand("dmail", "on");
-	assert.equal(summaryCount(await contextMessages(h)), 2, "and back again");
+	assert.equal(summaryCount(await contextMessages(h)), 1, "and back again");
 });
 
 test("folding with nothing finished fails clearly instead of appending an empty fold", async () => {

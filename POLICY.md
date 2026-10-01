@@ -4,8 +4,9 @@ You have a `send_dmail` tool. It removes a run of finished steps from everything
 you will be sent from now on, and puts a summary you write in their place.
 
 Folding is the primary way your context stays small — compaction is only the
-backstop, and it cuts by recency, not by usefulness. Fold as you go; do not save
-it for a phase boundary.
+backstop, and it cuts by recency, not by usefulness. Fold a run as its task ends.
+Folding earlier in a run is allowed and sometimes right — but it is provisional,
+and the closing fold absorbs it.
 
 ## The unit: a finished action
 
@@ -16,8 +17,8 @@ call. When several actions share one conclusion, fold them as one run.
 
 ## Fold timing
 
-Fold an observation as soon as it arrives, carrying the facts you have now and
-the conclusion you can state now. If you cannot conclude yet, say so — `cause
+Fold an observation when you can state its conclusion, carrying the facts you
+have now and that conclusion. If you cannot conclude yet, say so — `cause
 unknown` is a valid conclusion, and it is a fact about what you know. When the
 answer arrives later, fold that as its own action. Do not wait until you know
 everything to fold anything.
@@ -26,8 +27,33 @@ everything to fold anything.
 closed end to end is the strongest cut point: nothing that follows will change
 what its summary says. A summary written at a task boundary stays true for every
 request that comes after, and that is what lets this one rule generalize to the
-folds below you: past folds need no revisiting, because each one closed a task
-that is still closed. When a task completes, fold its whole run as one.
+folds below you: past task folds need no revisiting — each one closed a task
+that is still closed. When a task completes, fold its whole run as one, including
+the steps you already folded inside that run — one summary replaces the memos it
+absorbs.
+
+A task ends where its result is: a merged commit, a shipped fix, an answered
+question, a signed-off review, a ticket closed. A subagent's report is not a task
+end — it is already a summary. A failing test is not a task either; it is a step
+inside the task that fixes it.
+
+Folding inside a run is a pressure valve, not a rule to observe. Fold early when
+you are carrying more than you can hold, and treat that fold as provisional: it
+exists to protect the rest of the run, and the closing fold will overwrite it.
+You must fold mid-run anyway when five steps have passed since the last fold, or
+when one step produced a very large stretch of transcript.
+
+The closing fold starts where the run starts, not where its last provisional fold
+started. A fold starting inside a summary it does not reach back to leaves the old
+memo standing beside a new one, so the tool refuses it: if the run's first step
+is already folded, climb to the marker of the summary that covers it — the
+`[step N]` you can see above that memo — and fold from there, absorbing it.
+
+The one summary you write at the end carries the whole run forward, so write it
+for the session, not for the transcript: keep what work outside this task will
+depend on, and drop the mechanics that only mattered inside it. An absorbed memo
+is gone — nothing in the session can show it again — so anything later steps need
+must be in the new summary.
 
 **Preview before you commit.** The fold tool's `preview` parameter shows exactly
 what a fold would hide without hiding anything. Use it when a fold looks large
@@ -55,6 +81,12 @@ do not know under `open`.
 Everything else — an edit, a git command, an install, a subagent's report — is a
 judgement call: fold it if you can state its conclusion and will not act on its
 raw output again.
+
+Inside a run these are guidance, not debt: fold one when you need the room. The
+two that are never optional are a `failure` — you will need the error text again
+to fix it — and a run of five steps or one very large step with nothing folded
+since. At the end of the run, the fold that matters is the one that closes the
+task.
 
 ## In a verify loop
 
@@ -110,8 +142,9 @@ the last completed step) is folded, and the step you are in is kept. Pass
 
 Steps you folded keep their numbers, so the markers can jump (`[step 4]` then
 `[step 12]`) — read the markers, do not count. Folding from a step always carries
-every step in between; if you missed one, give it its own block. A step already
-folded away cannot be folded again.
+every step in between; if you missed one, give it its own block. A step you
+already folded can be folded again — that is how a task's closing fold absorbs the
+memos written inside it.
 
 Nothing is deleted from the session or from disk. Folding changes what you are
 shown, not what happened.
