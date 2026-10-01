@@ -7,6 +7,7 @@
   "files": [
     "index.ts",
     "fold.ts",
+    "dedupe.ts",
     "render.ts",
     "picker.ts",
     "picker-ui.ts",

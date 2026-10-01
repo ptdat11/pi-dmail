@@ -35,6 +35,14 @@ The idea is borrowed from Moonshot AI's
 `SendDMail` tool folds finished messages out of its own context into a self-written summary. Ours folds
 a range of steps; theirs rewinds to a checkpoint.
 
+A fold is sent **once**. The step that folds is never inside its own range, so its `send_dmail` call
+stays in the view — and would carry the summary's body in its arguments on every request after it. The
+hook rewrites that call down to the range it folded and trims its result to the headline and the
+advisory, so the body lives in the `<summary>` chip alone. Calls are matched only against records that
+replayed *this* view: a preview and a refused fold injected no chip, so their arguments are the only
+copy and stay untouched. Nothing is removed from the session — the transcript still holds the full
+call, and expanding the result still shows the whole summary.
+
 ## Install
 
 ```bash
@@ -174,7 +182,8 @@ observable. Output spend is unaffected, so prompt-side spend is printed as the c
 - `send_dmail` refuses a step that has already been folded out of view, and refuses the step the agent is
   currently in — there is nothing finished to fold yet.
 - Tests: `npm test` runs node's built-in runner over every `test/**/*.test.ts` — the fold algebra
-  (including the era split that counts orphaned records), the replay/refold wiring, the result renderer,
+  (including the era split that counts orphaned records), the replay/refold wiring, the one-copy summary
+  pass (`dedupe.ts`), the result renderer,
   orphan-visibility acceptance, the harness smoke tests, the policy injection (ladder guidance present when
   on, absent when off), the profiler, and the `settings.json` default-mode reader.
 - Release gate: `npm run verify:e2e` (or `make verify-e2e`) is the hand-runnable end-to-end seam

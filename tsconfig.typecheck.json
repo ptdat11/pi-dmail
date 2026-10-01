@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["index.ts", "fold.ts", "render.ts", "picker.ts", "economics.ts", "settings.ts", "profile.ts", "test"]
+  "include": ["index.ts", "fold.ts", "dedupe.ts", "render.ts", "picker.ts", "economics.ts", "settings.ts", "profile.ts", "test"]
 }

@@ -69,6 +69,7 @@ import {
 	type NumberedStep,
 	type ReplayPlan,
 } from "./fold.ts";
+import { redactFoldCalls } from "./dedupe.ts";
 import { evaluateEconomics, type Economics } from "./economics.ts";
 import {
 	type FoldRenderDetails,
@@ -1050,7 +1051,10 @@ export default function dmail(pi: ExtensionAPI): void {
 			});
 
 			if (!result.changed || result.messages.length === 0) return undefined;
-			return { messages: result.messages };
+			// One copy of the summary: the chip carries the body, so the call that
+			// wrote it keeps only its range (dedupe.ts). Applied records only — a
+			// preview or a refusal has no chip and keeps its arguments.
+			return { messages: redactFoldCalls(result.messages, { toolName: TOOL_NAME, applied: result.applied }) };
 		} catch {
 			// A context hook must never break a request: fall through to Pi's view.
 			return undefined;
