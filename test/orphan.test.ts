@@ -48,12 +48,13 @@ async function contextMessages(h: Awaited<ReturnType<typeof createHarness>>): Pr
  * endpoints) out of the view.
  */
 function orphanSession(): SessionFixture {
-	const fx = threeStepSession(); // e1..e6, steps 1–3
-	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "orphan summary", fromStep: 1 }); // e7
-	fx.user("fourth question"); // e8
-	fx.assistant("fourth answer"); // e9, step 4
-	fx.user("fifth question"); // e10
-	fx.assistant("fifth answer"); // e11, step 5
+	// Steps are turns: e1→1, e2→2, … e6→6, e8→7, e9→8, e10→9, e11→10.
+	const fx = threeStepSession(); // e1..e6, steps 1–6
+	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "orphan summary", fromStep: 2 }); // e7
+	fx.user("fourth question"); // e8, step 7
+	fx.assistant("fourth answer"); // e9, step 8
+	fx.user("fifth question"); // e10, step 9
+	fx.assistant("fifth answer"); // e11, step 10
 	fx.compaction({ summary: "earlier work", firstKeptEntryId: "e8" }); // e12
 	return fx;
 }
@@ -64,10 +65,10 @@ test("a pre-boundary fold record is skipped by replay, counted, and the count is
 	await h.start();
 
 	// The tool still works for the visible steps, and reports the orphan.
-	const result = await h.execute({ fromStep: 4, summary: "step 4 only" });
+	const result = await h.execute({ fromStep: 8, summary: "step 8 only" });
 	assertFoldDetails(result, {
-		fromStep: 4,
-		throughStep: 4,
+		fromStep: 8,
+		throughStep: 9, // the open end freezes below the round in flight (e11)
 		fromEntryId: "e9",
 		toEntryId: "e11",
 		skipped: 1,
@@ -75,14 +76,14 @@ test("a pre-boundary fold record is skipped by replay, counted, and the count is
 	assert.match(result.content[0].text, /folds skipped: 1/, "raw content fallback carries the count");
 
 	// Both drawn views carry it too.
-	const collapsed = h.render(result, { args: { summary: "step 4 only" } }).text();
+	const collapsed = h.render(result, { args: { summary: "step 8 only" } }).text();
 	assert.match(collapsed, /folds skipped: 1/, "collapsed view carries the count");
-	const expanded = h.render(result, { args: { summary: "step 4 only" }, expanded: true }).text();
+	const expanded = h.render(result, { args: { summary: "step 8 only" }, expanded: true }).text();
 	assert.match(expanded, /folds skipped: 1/, "expanded view carries the count");
 
 	// Replay: the in-view fold applies, the orphan's summary never appears.
 	const messages = await contextMessages(h);
-	assert.ok(messages.some((text) => text.includes("step 4 only")), "the new fold replayed");
+	assert.ok(messages.some((text) => text.includes("step 8 only")), "the new fold replayed");
 	assert.ok(!messages.some((text) => text.includes("orphan summary")), "the orphan never replayed");
 
 	// Determinism: replaying the same session again renders identically, count included.
@@ -98,7 +99,7 @@ test("a pre-boundary fold record is skipped by replay, counted, and the count is
 		fromEntryId: "e2",
 		toEntryId: "e6",
 		summary: "orphan summary",
-		fromStep: 1,
+		fromStep: 2,
 	});
 });
 
@@ -106,11 +107,11 @@ test("an orphan whose endpoints are still in view is still never replayed", asyn
 	const fx = threeStepSession(); // e1..e6
 	// Holder written early, pointing forward at steps that survive the boundary:
 	// without the era check this would validate and replay.
-	fx.foldRecord({ fromEntryId: "e9", toEntryId: "e11", summary: "forward orphan", fromStep: 4 }); // e7
-	fx.user("fourth question"); // e8
-	fx.assistant("fourth answer"); // e9, step 4
-	fx.user("fifth question"); // e10
-	fx.assistant("fifth answer"); // e11, step 5
+	fx.foldRecord({ fromEntryId: "e9", toEntryId: "e11", summary: "forward orphan", fromStep: 8 }); // e7
+	fx.user("fourth question"); // e8, step 7
+	fx.assistant("fourth answer"); // e9, step 8
+	fx.user("fifth question"); // e10, step 9
+	fx.assistant("fifth answer"); // e11, step 10
 	fx.compaction({ summary: "earlier work", firstKeptEntryId: "e9" }); // e12 — view starts after the holder
 
 	const h = await createHarness({ fixture: fx });
@@ -119,7 +120,7 @@ test("an orphan whose endpoints are still in view is still never replayed", asyn
 	const messages = await contextMessages(h);
 	assert.ok(!messages.some((text) => text.includes("forward orphan")), "holder out of era: never replayed");
 
-	const result = await h.execute({ fromStep: 4, summary: "step 4 only" });
+	const result = await h.execute({ fromStep: 8, summary: "step 8 only" });
 	assert.equal(result.details.skipped, 1, "counted anyway");
 	assert.match(result.content[0].text, /folds skipped: 1/);
 });
@@ -128,11 +129,11 @@ test("without a boundary nothing is skipped: no count in content or drawn views"
 	const h = await createHarness();
 	await h.start();
 
-	const result = await h.execute({ fromStep: 1, summary: "steps 1-2" });
+	const result = await h.execute({ fromStep: 1, summary: "step 1 only" });
 	assert.equal(result.details.skipped, undefined, "no skipped key when nothing was skipped");
 	assert.ok(!result.content[0].text.includes("folds skipped"), "content stays clean");
-	assert.ok(!h.render(result, { args: { summary: "steps 1-2" } }).text().includes("folds skipped"));
+	assert.ok(!h.render(result, { args: { summary: "step 1 only" } }).text().includes("folds skipped"));
 	assert.ok(
-		!h.render(result, { args: { summary: "steps 1-2" }, expanded: true }).text().includes("folds skipped"),
+		!h.render(result, { args: { summary: "step 1 only" }, expanded: true }).text().includes("folds skipped"),
 	);
 });

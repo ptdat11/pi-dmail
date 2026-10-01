@@ -43,15 +43,15 @@ test("a re-fold from a start inside an existing fold region is refused, naming t
 	const h = await createHarness();
 	await h.start();
 
-	const first = await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
-	assertFoldDetails(first, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const first = await h.execute({ fromStep: 1, summary: "S1 covers the first two exchanges" });
+	assertFoldDetails(first, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 
-	// Step 2's assistant is already folded away. Starting there would leave S1 standing
+	// Step 2's answer is already folded away. Starting there would leave S1 standing
 	// beside a second summary covering the same transcript, so the fold refuses and
 	// points at step 1 — the marker of the summary to absorb.
 	await assert.rejects(
 		h.execute({ fromStep: 2, summary: "S2 covers step 2" }),
-		/inside a fold that already covers steps 1 – 2\. Fold from step 1 instead/,
+		/inside a fold that already covers steps 1 – 5\. Fold from step 1 instead/,
 	);
 	assert.deepEqual(
 		h.pi.appended.map((entry) => entry.customType),
@@ -60,17 +60,17 @@ test("a re-fold from a start inside an existing fold region is refused, naming t
 	);
 
 	// Climbing to that marker folds: the new summary replaces S1 instead of stacking on it.
-	const climbed = await h.execute({ fromStep: 1, throughStep: 2, summary: "S1 and S2 together" });
-	assertFoldDetails(climbed, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const climbed = await h.execute({ fromStep: 1, throughStep: 5, summary: "S1 and S2 together" });
+	assertFoldDetails(climbed, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 	const messages = await contextMessages(h);
 	assert.equal(summaryCount(messages), 1, "the older memo is replaced, not left beside the new one");
 	assert.ok(messages.some((text) => text.includes("S1 and S2 together")));
-	assert.ok(!messages.some((text) => text.includes("S1 covers steps 1-2")), "the absorbed memo is gone from the view");
+	assert.ok(!messages.some((text) => text.includes("S1 covers the first two exchanges")), "the absorbed memo is gone from the view");
 
 	// The surviving step keeps its branch number; folding never renumbers it.
 	const lastKept = messages.findIndex((text) => text.includes("third answer"));
 	assert.ok(lastKept > 0, "the step you are in is still rendered");
-	assert.match(messages[lastKept - 1], /^\[step 3\]$/);
+	assert.match(messages[lastKept - 1], /^\[step 6\]$/);
 });
 
 test("stacked re-folds render each surviving summary with its original step marker", async () => {
@@ -91,7 +91,7 @@ test("stacked re-folds render each surviving summary with its original step mark
 	// The surviving step keeps its branch number; folding never renumbers it.
 	const lastKept = messages.findIndex((text) => text.includes("third answer"));
 	assert.ok(lastKept > 0, "the step you are in is still rendered");
-	assert.match(messages[lastKept - 1], /^\[step 3\]$/);
+	assert.match(messages[lastKept - 1], /^\[step 6\]$/);
 });
 
 test("a same-start re-fold replaces the older summary, not stacks it", async () => {
@@ -112,8 +112,8 @@ test("a same-start re-fold replaces the older summary, not stacks it", async () 
 test("/dmail off hands back the full raw transcript after stacked re-folds", async () => {
 	const h = await createHarness();
 	await h.start();
-	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2" });
-	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2, tightened" });
+	await h.execute({ fromStep: 1, summary: "S1 covers the first two exchanges" });
+	await h.execute({ fromStep: 1, summary: "S1 covers the first two exchanges, tightened" });
 
 	const folded = await contextMessages(h);
 	assert.equal(summaryCount(folded), 1);
@@ -138,7 +138,7 @@ test("/dmail off hands back the full raw transcript after stacked re-folds", asy
 	assert.ok(!restored.some((text) => text.includes("first answer")), "folded steps stay folded while enabled");
 
 	// A third stacked re-fold (same start again) toggles just as cleanly.
-	await h.execute({ fromStep: 1, summary: "S1 covers steps 1-2, twice over" });
+	await h.execute({ fromStep: 1, summary: "S1 covers the first two exchanges, twice over" });
 	const stacked = await contextMessages(h);
 	assert.equal(summaryCount(stacked), 1, "each re-fold replaced the summary at that start");
 	assert.ok(stacked.some((text) => text.includes("twice over")));
@@ -157,14 +157,17 @@ test("folding with nothing finished fails clearly instead of appending an empty 
 	const h = await createHarness({ fixture });
 	await h.start();
 
+	// Step 1 is the question and step 2 the answer being written; step 2 is the one
+	// you are in, so it is the one nothing may be cut at.
 	await assert.rejects(
-		h.execute({ fromStep: 1, summary: "fold myself" }),
-		/Step 1 is the step you are in, so there is nothing finished to fold yet/,
+		h.execute({ fromStep: 2, summary: "fold myself" }),
+		/Step 2 is the step you are in, so there is nothing finished to fold yet/,
 	);
 	assert.equal(h.pi.appended.length, 0, "no record was appended");
 
 	// The view is unchanged: markers, no summaries.
 	const messages = await contextMessages(h);
 	assert.equal(summaryCount(messages), 0);
-	assert.ok(messages.some((text) => text === "[step 1]"), "the step marker still renders");
+	assert.ok(messages.some((text) => text === "[step 1]"), "the question's own marker still renders");
+	assert.ok(messages.some((text) => text === "[step 2]"), "and the answer's");
 });

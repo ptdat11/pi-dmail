@@ -42,7 +42,7 @@ export class SessionFixture {
 		});
 	}
 
-	/** Assistant turn (text only). Assistant messages are step boundaries. */
+	/** Assistant turn (text only). */
 	assistant(text: string): SessionEntry {
 		return this.append({
 			type: "message",
@@ -79,7 +79,7 @@ export class SessionFixture {
 		});
 	}
 
-	/** Result of a tool call (role "toolResult"; not a step boundary). */
+	/** Result of a tool call (role "toolResult"; never a step, so never a fold boundary). */
 	toolResult(toolCallId: string, toolName: string, text: string): SessionEntry {
 		return this.append({
 			type: "message",
@@ -111,8 +111,8 @@ export class SessionFixture {
 }
 
 /**
- * A short standard session: three exchanges, so three visible steps
- * (user e1 → assistant e2 … user e5 → assistant e6). Steps = assistant messages.
+ * A short standard session: three exchanges, so six visible steps — one per turn,
+ * prompt included (user e1 → step 1, assistant e2 → step 2 … assistant e6 → step 6).
  */
 export function threeStepSession(): SessionFixture {
 	const fx = new SessionFixture();

@@ -135,9 +135,10 @@ Do not fold the step you are in.
 
 ## How to name steps
 
-Steps are numbered in the conversation as `[step 3]`. Pass the earliest step you
-are done with as `fromStep`. Everything from there through `throughStep` (default:
-the last completed step) is folded, and the step you are in is kept. Pass
+Steps are numbered in the conversation as `[step 3]` — one per message turn, the
+user's and yours. Pass the earliest step you are done with as `fromStep`. Everything
+from there through `throughStep` (default: the last completed step) is folded, and
+the step you are in is kept. Pass
 `throughStep` explicitly, inclusive, when a later step is still worth keeping raw.
 
 Steps you folded keep their numbers, so the markers can jump (`[step 4]` then
@@ -145,6 +146,11 @@ Steps you folded keep their numbers, so the markers can jump (`[step 4]` then
 every step in between; if you missed one, give it its own block. A step you
 already folded can be folded again — that is how a task's closing fold absorbs the
 memos written inside it.
+
+Because a request is a step like any other, the user's own message can go too:
+name the request's step as `fromStep` to fold it with the answer it produced, or
+stop there with `throughStep` to keep a request whose answer is still worth reading
+raw.
 
 Nothing is deleted from the session or from disk. Folding changes what you are
 shown, not what happened.

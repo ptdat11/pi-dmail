@@ -126,6 +126,83 @@ test("with no round in progress, the newest step is a row like any other", () =>
 	assert.equal(endStepOf(rows[0]), 5, "the newest step is also the default end");
 });
 
+/** Ten turns numbered 1–10, alternating requests and answers, as a real view has them. */
+function tenTurns(): NumberedStep[] {
+	return Array.from({ length: 10 }, (_, i) => ({ step: i + 1, entryId: `e${i + 1}`, index: i }));
+}
+
+const roleOfTurn = (step: NumberedStep) => (step.step % 2 === 1 ? "user" : "assistant");
+
+test("a request is a row like any other, and folds through itself", () => {
+	const steps = tenTurns();
+	const current = steps[steps.length - 1];
+	const rows = buildFoldPickerRows({
+		steps,
+		current,
+		estimateOf,
+		roleOf: roleOfTurn,
+		previewOf: (step) => `first line of step ${step.step}`,
+	});
+
+	assert.deepEqual(
+		rows.map((r) => r.fromStep),
+		[9, 8, 7, 6, 5, 4, 3, 2, 1],
+		"every turn but the one in progress is a row — questions included",
+	);
+	assert.equal(rows[8].label, "1  user: first line of step 1  ~1k", "the opening request is the oldest row");
+	assert.equal(rows[8].role, "user");
+	assert.equal(endStepOf(rows[8]), 1, "a request is an end of its own cut, like any other step");
+});
+
+test("a fold that starts on a request collapses with what it swallowed into one region row", () => {
+	const steps = tenTurns();
+	const rows = buildFoldPickerRows({
+		steps,
+		current: steps[steps.length - 1],
+		estimateOf,
+		roleOf: roleOfTurn,
+		// Steps 1–3 folded: the request, its answer, and the next request.
+		folds: [{ fromEntryId: "e1", toEntryId: "e4", fromStep: 1, summary: "The opening exchange." }],
+		previewOf: (step) => `line ${step.step}`,
+	});
+
+	assert.deepEqual(
+		rows.map((r) => `${r.kind}:${r.fromStep}`),
+		["step:9", "step:8", "step:7", "step:6", "step:5", "step:4", "folded:1"],
+		"one row covers the three turns it swallowed (step 10 is in flight)",
+	);
+	assert.deepEqual(rows[6].range, [1, 3], "the region brackets the whole span it covers");
+	assert.equal(rows[6].label, "[1 - 3]  fold: The opening exchange.  ~1k");
+	assert.equal(endStepOf(rows[6]), 3, "as an end the region folds through the last step it covers");
+});
+
+test("validEnds takes a region's own end, which no visible step names", () => {
+	const steps = tenTurns();
+	const current = steps[steps.length - 1];
+	const visible = steps.filter((step) => step.step >= 4 && step.step < current.step); // 1–3 folded away, 10 in flight
+
+	assert.deepEqual(
+		validEnds(visible, current, 1, [3]),
+		[9, 8, 7, 6, 5, 4, 3],
+		"step 3 is gone from view but still a legal end: stopping there folds the whole region",
+	);
+	assert.deepEqual(
+		validEnds(visible, current, 4, [3]),
+		[9, 8, 7, 6, 5, 4],
+		"a start below the region cannot reach back into it",
+	);
+	assert.deepEqual(
+		validEnds(visible, current, 1, [3, 7]),
+		[9, 8, 7, 6, 5, 4, 3],
+		"two regions contribute two ends, and neither duplicates a visible step",
+	);
+	assert.deepEqual(
+		validEnds(visible, current, 1, [10, 3]),
+		[9, 8, 7, 6, 5, 4, 3],
+		"the step in progress is never an end, whichever list names it — but the region's still is",
+	);
+});
+
 test("validEnds and latestFinishedStep follow whether a round is in flight", () => {
 	const steps = fiveSteps();
 	const current = steps[steps.length - 1];

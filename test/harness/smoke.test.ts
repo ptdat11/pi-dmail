@@ -23,7 +23,7 @@ test("harness registers the extension like pi would", async () => {
 });
 
 test("smoke: execute folds steps and renderResult renders the folded view", async () => {
-	const fixture = threeStepSession(); // e1..e6; steps 1–3 are the assistant messages e2, e4, e6
+	const fixture = threeStepSession(); // e1..e6; steps 1–6 are the turns, e1 (the question) first
 	const h = await createHarness({ fixture });
 	await h.start();
 
@@ -32,7 +32,7 @@ test("smoke: execute folds steps and renderResult renders the folded view", asyn
 
 	// Shared fold-result contract (ticket 04): range, advisory economics, and
 	// predicted-vs-actual placeholders; returns details for local checks.
-	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 
 	// The fold record lands both in pi's appends and on the session itself, and
 	// carries the same prediction so offline scoring can read it back (06).
@@ -40,7 +40,7 @@ test("smoke: execute folds steps and renderResult renders the folded view", asyn
 	assert.deepEqual(h.pi.appended[0], {
 		customType: FOLD_TYPE,
 		data: {
-			fromEntryId: "e2",
+			fromEntryId: "e1",
 			toEntryId: "e6",
 			summary,
 			fromStep: 1,
@@ -55,25 +55,25 @@ test("smoke: execute folds steps and renderResult renders the folded view", asyn
 	// Raw fallback: the headline first, the advisory under it.
 	assert.equal(
 		result.content[0].text.split("\n")[0],
-		"Folded steps 1 through 2. They are replaced by your summary from the next request on.",
+		"Folded steps 1 through 5. They are replaced by your summary from the next request on.",
 	);
 	assert.match(result.content[0].text, /tokens removed/);
 
 	// The user-facing notification.
 	assert.deepEqual(h.ui.notifications, [
-		{ message: "Folded steps 1–2. In effect from the next request.", type: "info" },
+		{ message: "Folded steps 1–5. In effect from the next request.", type: "info" },
 	]);
 
 	// Collapsed render: plain-text folded view via the real Text component.
 	const collapsed = h.render(result, { args: { fromStep: 1, summary } });
 	const collapsedText = collapsed.text();
 	assert.match(collapsedText, /✓/);
-	assert.match(collapsedText, /Folded steps 1–2/);
+	assert.match(collapsedText, /Folded steps 1–5/);
 	assert.match(collapsedText, /Opening exchange/);
 
 	// Expanded render: full summary body.
 	const expandedText = h.render(result, { args: { fromStep: 1, summary }, expanded: true }).text();
-	assert.match(expandedText, /Folded steps 1–2/);
+	assert.match(expandedText, /Folded steps 1–5/);
 	assert.match(expandedText, /Opening exchange/);
 });
 
@@ -81,7 +81,7 @@ test("smoke: execute refuses to fold into the current or a missing step", async 
 	const h = await createHarness();
 	await h.start();
 
-	await assert.rejects(h.execute({ fromStep: 3, summary: "fold myself" }), /Step 3 is the step you are in/);
+	await assert.rejects(h.execute({ fromStep: 6, summary: "fold myself" }), /Step 6 is the step you are in/);
 	await assert.rejects(h.execute({ fromStep: 9, summary: "nonexistent" }), /There is no step 9/);
 	await assert.rejects(h.execute({ fromStep: 1, summary: "   " }), /The summary is empty/);
 	assert.equal(h.pi.appended.length, 0, "no fold record on refused folds");
@@ -135,7 +135,7 @@ test("fixture builders chain ids and build compaction boundaries", async () => {
 });
 
 test("harness: the session view starts at a compaction boundary and folds see it", async () => {
-	const fixture = threeStepSession(); // e1..e6, steps 1–3
+	const fixture = threeStepSession(); // e1..e6, steps 1–6
 	const compaction = fixture.compaction({ summary: "earlier work", firstKeptEntryId: "e5" }); // e7
 	const h = await createHarness({ fixture });
 
@@ -149,6 +149,6 @@ test("harness: the session view starts at a compaction boundary and folds see it
 	// Steps behind the boundary are gone from view, so the fold tool refuses them…
 	await assert.rejects(h.execute({ fromStep: 1, summary: "gone" }), /already been folded out of view/);
 	// …while the surviving step is still listable.
-	await assert.rejects(h.execute({ fromStep: 9, summary: "nope" }), /Visible steps: \[3\]/);
+	await assert.rejects(h.execute({ fromStep: 9, summary: "nope" }), /Visible steps: \[5, 6\]/);
 	assert.equal(h.pi.appended.length, 0, "no fold record on refused folds");
 });

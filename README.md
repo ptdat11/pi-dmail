@@ -18,17 +18,19 @@ the loop that actually knows which steps it is done with — and pi gave it no w
 
 ## How it works
 
-D-Mail adds one tool, `send_dmail(fromStep, summary)`. The agent sees a `[step N]` marker before each
-assistant turn, and calling the tool records that everything from `fromStep` through `throughStep` (by
-default, the last *completed* step) is finished with, and that `summary` replaces it. A `context` hook
-replays those records on every request, so the agent is sent the summary instead of the transcript.
+D-Mail adds one tool, `send_dmail(fromStep, summary)`. A step is one message turn — the user's and
+the assistant's alike — and the agent sees a `[step N]` marker before each one. Calling the tool records
+that everything from `fromStep` through `throughStep` (by default, the last *completed* step) is
+finished with, and that `summary` replaces it. A `context` hook replays those records on every request,
+so the agent is sent the summary instead of the transcript.
 
 The step the agent is currently in is never folded, so it passes the earliest step it is done with, not
 the current one. The end of the range is resolved once, at call time, and frozen — either the caller's
 `throughStep` or the last completed step — so a fold cannot quietly swallow every step that follows it.
 Both endpoints are step starts, which is what keeps a tool call and its result on the same side of the
-cut. Numbers come from the branch, so a step keeps its number even after
-it is folded away — but markers are only emitted for steps still in view.
+cut. A request is a boundary like an answer, so the user can fold their own message out of context and
+a fold may stop just before one. Numbers come from the branch, so a step keeps its number even after it
+is folded away — but markers are only emitted for steps still in view.
 
 The idea is borrowed from Moonshot AI's
 [Kimi CLI](https://github.com/MoonshotAI/kimi-cli/blob/main/src/kimi_cli/tools/dmail/dmail.md), whose

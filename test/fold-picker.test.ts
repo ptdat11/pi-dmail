@@ -33,7 +33,10 @@ function messageText(content: unknown): string {
 
 type Harness = Awaited<ReturnType<typeof createHarness>>;
 
-/** Five visible steps; step 2 already folded — the picker must collapse it. */
+/**
+ * Five exchanges, so ten turns; steps 4–5 already folded — the picker must collapse
+ * them into one row. Turns are steps: q1→1, a1→2, q2→3, a2→4, …, a5→10.
+ */
 function foldedFiveStepSession(): SessionFixture {
 	const fx = new SessionFixture();
 	fx.user("q1");
@@ -46,7 +49,7 @@ function foldedFiveStepSession(): SessionFixture {
 	fx.assistant("alpha four — invitations sent\nsecret second line");
 	fx.user("q5");
 	fx.assistant("alpha five — replies pending");
-	fx.foldRecord({ fromEntryId: "e4", toEntryId: "e6", summary: "Venue booked: the hall.", fromStep: 2 });
+	fx.foldRecord({ fromEntryId: "e4", toEntryId: "e6", summary: "Venue booked: the hall.", fromStep: 4 });
 	return fx;
 }
 
@@ -67,17 +70,19 @@ test("the picker lists every finished step latest first with role, peek, a quiet
 	// Nothing is running in this session, so the newest step is a row like any other.
 	assert.deepEqual(
 		labels.map((label) => label.split("  ")[0]),
-		["5", "4", "3", "[2]", "1"],
-		"one row per visible step, the folded step collapsed to its bracketed range, newest first",
+		["10", "9", "8", "7", "6", "[4 - 5]", "3", "2", "1"],
+		"one row per visible turn — questions included — the folded range collapsed to its bracketed range, newest first",
 	);
 	for (const label of labels) {
 		assert.match(label, / ~\+?\d[\d.]*k?$/, `row carries a quiet ~Nk estimate: ${label}`);
 	}
-	assert.match(labels[0], /^5  assistant: alpha five — replies pending  ~/, "the newest step is offered when nothing is in progress");
-	assert.match(labels[1], /^4  assistant: alpha four — invitations sent  ~/);
-	assert.match(labels[3], /^\[2\]  fold: Venue booked: the hall\.  ~/, "the region row peeks at its summary");
-	assert.match(labels[4], /^1  assistant: alpha one — the goal and the constraints decided there  ~/);
-	assert.ok(!labels[1].includes("secret second line"), "preview is the first line only");
+	assert.match(labels[0], /^10  assistant: alpha five — replies pending  ~/, "the newest step is offered when nothing is in progress");
+	assert.match(labels[1], /^9  user: q5  ~/, "a question is a row like any other turn");
+	assert.match(labels[2], /^8  assistant: alpha four — invitations sent  ~/);
+	assert.match(labels[5], /^\[4 - 5\]  fold: Venue booked: the hall\.  ~/, "the region row peeks at its summary, and names the whole range it covers");
+	assert.match(labels[7], /^2  assistant: alpha one — the goal and the constraints decided there  ~/);
+	assert.match(labels[8], /^1  user: q1  ~/, "the opening request is the last row, and it is a step of its own");
+	assert.ok(!labels[2].includes("secret second line"), "preview is the first line only");
 
 	// What the TUI actually renders in phase 1: title, legend, cursor, position footer.
 	const lines = (h.ui.customs[0].component as FoldPickerComponent).render(120).join("\n");
@@ -86,7 +91,7 @@ test("the picker lists every finished step latest first with role, peek, a quiet
 	assert.match(lines, /the end is the latest finished step/, "legend: the end is the latest finished step");
 	assert.match(lines, /~ ≈ tokens this cut removes/, "legend explains the quiet estimate");
 	assert.match(lines, /› /, "cursor marks the selected row");
-	assert.match(lines, /\(1\/5\)/, "the cursor starts on the newest step");
+	assert.match(lines, /\(1\/9\)/, "the cursor starts on the newest step");
 
 	// Cancelling changes nothing.
 	assert.equal(h.pi.sentMessages.length, 0, "cancel sends no prompt");
@@ -103,7 +108,7 @@ test("Enter twice on an idle session takes the newest step, which folds because 
 
 	assert.equal(h.pi.sentMessages.length, 1, "one pinned prompt to the agent");
 	const { content, options: msgOptions } = h.pi.sentMessages[0];
-	assert.match(messageText(content), /pinned the cut: fold from step 1 through step 5/, "start pinned, end is the newest step in view");
+	assert.match(messageText(content), /pinned the cut: fold from step 1 through step 10/, "start pinned, end is the newest step in view");
 	assert.match(
 		messageText(content),
 		/the newest step in view, which folds because the round that folds is the step after it/,
@@ -111,12 +116,12 @@ test("Enter twice on an idle session takes the newest step, which folds because 
 	);
 	assert.match(
 		messageText(content),
-		/send_dmail\(fromStep=1, throughStep=5, summary\)/,
+		/send_dmail\(fromStep=1, throughStep=10, summary\)/,
 		"a newest-step end is named explicitly, so a fold in a later round cannot widen the cut",
 	);
 	assert.match(messageText(content), /tell the user when the fold lands/, "the agent confirms the fold to the user");
 	assert.equal(msgOptions?.deliverAs, undefined, "idle agent → plain send");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 5\]/, "the command names the range");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 10\]/, "the command names the range");
 });
 
 test("with a round in flight, Enter twice pins exactly the frozen end: everything finished, nothing running", async () => {
@@ -128,19 +133,19 @@ test("with a round in flight, Enter twice pins exactly the frozen end: everythin
 
 	assert.deepEqual(
 		[...(h.ui.customs[0].component as FoldPickerComponent).rows].map((row) => row.fromStep),
-		[4, 3, 2, 1],
-		"the in-progress step is not a row while it is running",
+		[9, 8, 7, 6, 4, 3, 2, 1],
+		"the in-progress step is not a row while it is running, and every other turn is",
 	);
 	const { content } = h.pi.sentMessages[0];
-	assert.match(messageText(content), /pinned the cut: fold from step 1 through step 4/, "the end is the latest finished step");
+	assert.match(messageText(content), /pinned the cut: fold from step 1 through step 9/, "the end is the latest finished step");
 	assert.match(messageText(content), /, the latest finished step\./, "and the sentence says so in words");
 	assert.match(
 		messageText(content),
-		/send_dmail\(fromStep=1, throughStep=4, summary\)/,
+		/send_dmail\(fromStep=1, throughStep=9, summary\)/,
 		"the end is named anyway: the fold lands a round later, when the tool's default has moved",
 	);
 	assert.doesNotMatch(messageText(content), /newest step in view/, "that explanation belongs to an idle session only");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 4\]/, "the command names the range");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 9\]/, "the command names the range");
 });
 
 test("an idle pin of the newest step becomes a real fold once the agent's round follows it", async () => {
@@ -148,9 +153,9 @@ test("an idle pin of the newest step becomes a real fold once the agent's round 
 	const h = await createHarness({ fixture });
 	await h.start();
 
-	h.ui.scriptCustom({ fromStep: 5, throughStep: 5 });
+	h.ui.scriptCustom({ fromStep: 10, throughStep: 10 });
 	await h.runCommand("dmail", "fold");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /^Pinned \[5\] —/, "the newest step alone is a legal single-step cut");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /^Pinned \[10\] —/, "the newest step alone is a legal single-step cut");
 
 	// The agent makes the call the prompt spelled out — parsed out of the sentence here,
 	// so prompt/call drift cannot pass a test unnoticed.
@@ -160,8 +165,9 @@ test("an idle pin of the newest step becomes a real fold once the agent's round 
 
 	// The pin itself arrives as a message, and the round that folds follows it. pi
 	// persists that round before running its tools, so by the time send_dmail executes
-	// there IS a step start after step 5, and the record's exclusive end is that
-	// round's entry — which takes the pin prompt away with the rest of the archive.
+	// there IS a step start after step 10 — the pinned prompt itself, now a turn —
+	// and the record's exclusive end is that round's entry, which takes the pin
+	// prompt away with the rest of the archive.
 	fixture.user(prompt);
 	fixture.assistant("the round that folds");
 	const result = await h.execute({
@@ -169,20 +175,20 @@ test("an idle pin of the newest step becomes a real fold once the agent's round 
 		throughStep: Number(called![2]),
 		summary: "Replies pending; nothing else outstanding.",
 	});
-	assertFoldDetails(result, { fromStep: 5, throughStep: 5, fromEntryId: "e10", toEntryId: "e13" });
+	assertFoldDetails(result, { fromStep: 10, throughStep: 10, fromEntryId: "e10", toEntryId: "e12" });
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/^Folded steps 5–5\. In effect from the next request\. Folded on your behalf \[5\]\./,
+		/^Folded steps 10–10\. In effect from the next request\. Folded on your behalf \[10\]\./,
 	);
 });
 
 test("a fold that lands wider than the pin is reported as itself, not credited to the pin", async () => {
 	const fixture = foldedFiveStepSession();
-	// Pin [1 - 4] while step 5 is the round in flight.
+	// Pin [1 - 9] while step 10 is the round in flight.
 	const h = await createHarness({ fixture, idle: false });
 	await h.start();
-	await h.runCommand("dmail", "fold 1 4");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 4\]/);
+	await h.runCommand("dmail", "fold 1 9");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 9\]/);
 
 	// An agent that drops the end from its call then folds two turns later: the round
 	// that was in flight has finished, another is running, and the tool's default end
@@ -191,10 +197,10 @@ test("a fold that lands wider than the pin is reported as itself, not credited t
 	fixture.assistant("a further turn, swallowed by the default end");
 	const result = await h.execute({ fromStep: 1, summary: "Everything the later steps still need." });
 
-	assert.equal(result.details.throughStep, 6, "the default end is the newest finished step, not the pinned one");
+	assert.equal(result.details.throughStep, 11, "the default end is the newest finished step, not the pinned one");
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/^Folded steps 1–6\./,
+		/^Folded steps 1–11\./,
 		"the confirmation reports the range that was actually folded",
 	);
 	assert.doesNotMatch(h.ui.notifications.at(-1)?.message ?? "", /on your behalf/, "…and does not claim the user chose it");
@@ -205,42 +211,65 @@ test("a collapsed region row is a legal END as well as a start: the whole region
 	const h = await createHarness({ fixture });
 	await h.start();
 
-	h.ui.scriptCustom({ fromStep: 1, throughStep: 2 }); // start 1, end = the "[2]" region row
+	// The region's end is step 5, whose entry is gone: a step start that only the
+	// region row names, and a legal end for exactly that reason.
+	h.ui.scriptCustom({ fromStep: 1, throughStep: 5 }); // start 1, end = the "[4 - 5]" region row
 	await h.runCommand("dmail", "fold");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 2\]/, "the picker offers its own region row as an end");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 5\]/, "the picker offers its own region row as an end, and the tool accepts it");
 
 	fixture.assistant("the round that folds");
-	const result = await h.execute({ fromStep: 1, throughStep: 2, summary: "Goal, constraints, and the booked venue." });
-	// The new record spans step 1's entry to step 3's, so it swallows the earlier
+	const result = await h.execute({ fromStep: 1, throughStep: 5, summary: "Goal, constraints, and the booked venue." });
+	// The new record spans step 1's entry to step 6's, so it swallows the earlier
 	// fold's range and its summary is superseded by containment, newest wins.
-	assertFoldDetails(result, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	assertFoldDetails(result, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 });
 
 test("the second Enter picks the far end: the pending range shows while it is picked and the pin names it", async () => {
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	h.ui.scriptCustom({ fromStep: 1, throughStep: 3 });
+	h.ui.scriptCustom({ fromStep: 1, throughStep: 5 });
 	await h.runCommand("dmail", "fold");
 
 	const lines = (h.ui.customs[0].component as FoldPickerComponent).render(120).join("\n");
 	assert.match(lines, /Through which step\?/, "phase 2 retitles the same list");
-	assert.match(lines, /\[1 - 3\]/, "the pending range is shown while the end is picked");
+	assert.match(lines, /\[1 - 5\]/, "the pending range is shown while the end is picked");
 	assert.match(lines, /~ ≈ tokens this cut removes/, "…priced as one live figure");
-	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 1 through step 3/);
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 1 through step 5/);
 	assert.match(
 		messageText(h.pi.sentMessages[0].content),
-		/send_dmail\(fromStep=1, throughStep=3, summary\)/,
+		/send_dmail\(fromStep=1, throughStep=5, summary\)/,
 		"a chosen end travels with the prompt",
 	);
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 3\]/);
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 5\]/);
+});
+
+test("a request is foldable from the command line too: /dmail fold 1 N", async () => {
+	const h = await createHarness({ fixture: foldedFiveStepSession() });
+	await h.start();
+
+	await h.runCommand("dmail", "fold 1 4");
+	const prompt = messageText(h.pi.sentMessages[0].content);
+	assert.match(prompt, /fold from step 1 through step 4/, "the pin names the opening request as its start");
+	assert.match(prompt, /send_dmail\(fromStep=1, throughStep=4, summary\)/, "the tool call travels as 1");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 4\]/, "the user sees the range they typed");
+
+	// One turn is a legal range: from the question to its own answer.
+	await h.runCommand("dmail", "fold 1 1");
+	assert.match(messageText(h.pi.sentMessages[1].content), /fold from step 1 through step 1/);
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /^Pinned \[1\] —/);
+
+	// There is no step before the first one, and the same validation says so.
+	await h.runCommand("dmail", "fold 0 4");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 0 to fold from\. Starts: \[/);
+	assert.equal(h.pi.sentMessages.length, 2, "the refused range never reached the agent");
 });
 
 test("escape in phase 2 returns to the list, where another range can still be pinned", async () => {
 	const h = await createHarness({ fixture: foldedFiveStepSession() });
 	await h.start();
 
-	h.ui.scriptCustom({ fromStep: 3, back: true, thenFromStep: 1, throughStep: 2 });
+	h.ui.scriptCustom({ fromStep: 6, back: true, thenFromStep: 1, throughStep: 2 });
 	await h.runCommand("dmail", "fold");
 
 	assert.equal(h.pi.sentMessages.length, 1, "an escape from phase 2 is not a cancel: the second pick lands");
@@ -253,25 +282,25 @@ test("picking a collapsed folded-region row is a legal start", async () => {
 	const h = await createHarness({ fixture });
 	await h.start();
 
-	h.ui.scriptCustom(2); // the "[2]  fold: …" row
+	h.ui.scriptCustom(4); // the "[4]  fold: …" row
 	await h.runCommand("dmail", "fold");
 
 	assert.equal(h.pi.sentMessages.length, 1);
-	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 2 through step 5/, "the default end is the newest step in view");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[2 - 5\]/);
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 4 through step 10/, "the default end is the newest step in view");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[4 - 10\]/);
 
 	// …and the fold tool accepts that pinned start: the agent can really fold from it,
 	// once its own round supplies the step start after the pinned end.
 	fixture.assistant("the round that folds");
 	const result = await h.execute({
-		fromStep: 2,
-		throughStep: 5,
+		fromStep: 4,
+		throughStep: 10,
 		summary: "Venue booked: the hall; travel and invitations follow.",
 	});
-	assertFoldDetails(result, { fromStep: 2, throughStep: 5, fromEntryId: "e4", toEntryId: "e12" });
+	assertFoldDetails(result, { fromStep: 4, throughStep: 10, fromEntryId: "e4", toEntryId: "e12" });
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/^Folded steps 2–5\. In effect from the next request\. Folded on your behalf \[2 - 5\]\./,
+		/^Folded steps 4–10\. In effect from the next request\. Folded on your behalf \[4 - 10\]\./,
 		"the confirmation names the pinned range",
 	);
 });
@@ -280,12 +309,12 @@ test("a busy agent gets the pinned start through the follow-up delivery variant"
 	const h = await createHarness({ fixture: foldedFiveStepSession(), idle: false });
 	await h.start();
 
-	await h.runCommand("dmail", "fold 3");
+	await h.runCommand("dmail", "fold 6");
 
 	assert.equal(h.pi.sentMessages[0].options?.deliverAs, "followUp");
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /finishes the current turn/);
 	assert.equal(h.ui.customs.length, 0, "an explicit start never opens the picker");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[3 - 4\]/);
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[6 - 9\]/);
 });
 
 test("without an interactive UI the printed list still lets the user pin a range", async () => {
@@ -297,28 +326,28 @@ test("without an interactive UI the printed list still lets the user pin a range
 
 	const printed = h.ui.notifications.at(-1)?.message ?? "";
 	assert.match(printed, /pin a range with \/dmail fold <start> \[<end>\]/, "the headless form names both ends");
-	assert.match(printed, /· \[2\]  fold: Venue booked: the hall\./, "the fallback list is the same row set");
-	assert.match(printed, /· 5  assistant: alpha five — replies pending/, "the newest step is listed when nothing is running");
+	assert.match(printed, /· \[4 - 5\]  fold: Venue booked: the hall\./, "the fallback list is the same row set");
+	assert.match(printed, /· 10  assistant: alpha five — replies pending/, "the newest step is listed when nothing is running");
 	assert.equal(h.pi.sentMessages.length, 0, "the printed list itself pins nothing");
 
 	await h.runCommand("dmail", "fold 2");
 	assert.equal(h.pi.sentMessages.length, 1, "an explicit start pins without any picker");
-	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 2 through step 5/, "no end means the newest step in view");
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 2 through step 10/, "no end means the newest step in view");
 
 	// Two numbers pin an explicit range; a refused end names the ends that are valid.
-	await h.runCommand("dmail", "fold 1 3");
-	assert.match(messageText(h.pi.sentMessages[1]?.content ?? ""), /fold from step 1 through step 3/);
-	await h.runCommand("dmail", "fold 3 2");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 2 to fold through\. Ends: \[5, 4, 3\]\./);
-	await h.runCommand("dmail", "fold 3 3");
-	assert.match(messageText(h.pi.sentMessages[2]?.content ?? ""), /fold from step 3 through step 3/, "A == B is legal");
+	await h.runCommand("dmail", "fold 1 6");
+	assert.match(messageText(h.pi.sentMessages[1]?.content ?? ""), /fold from step 1 through step 6/);
+	await h.runCommand("dmail", "fold 6 4");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 4 to fold through\. Ends: \[10, 9, 8, 7, 6\]\./);
+	await h.runCommand("dmail", "fold 6 6");
+	assert.match(messageText(h.pi.sentMessages[2]?.content ?? ""), /fold from step 6 through step 6/, "A == B is legal");
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/^Pinned \[3\] —/,
-		"a single-step cut prints as [3], the same bracket the picker header uses",
+		/^Pinned \[6\] —/,
+		"a single-step cut prints as [5], the same bracket the picker header uses",
 	);
-	await h.runCommand("dmail", "fold 5 5");
-	assert.match(messageText(h.pi.sentMessages[3]?.content ?? ""), /fold from step 5 through step 5/, "the newest step headlessly, too");
+	await h.runCommand("dmail", "fold 10 10");
+	assert.match(messageText(h.pi.sentMessages[3]?.content ?? ""), /fold from step 10 through step 10/, "the newest step headlessly, too");
 	assert.equal(h.pi.appended.length, 0, "pinning still appends nothing");
 });
 
@@ -335,21 +364,21 @@ test("with ui.select but no ui.custom (rpc-style) two dialogs pin the range and 
 	const options = h.ui.selects[0].options;
 	assert.deepEqual(
 		options.map((option) => option.split("  ")[0]),
-		["5", "4", "3", "[2]", "1"],
+		["10", "9", "8", "7", "6", "[4 - 5]", "3", "2", "1"],
 		"the plain list shows the same rows, latest first",
 	);
 	assert.match(h.ui.selects[0].title, /The end is the latest finished step/, "and names the end it will take");
 
 	// A start, then an end: the end dialog names the pending start and only offers ends
 	// a fold from that start accepts — ends older than the start are not among them.
-	h.ui.scriptSelect(options[2], options[2]);
+	h.ui.scriptSelect(options[6], options[6]);
 	await h.runCommand("dmail", "fold");
 	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 3 through step 3/, "A == B is legal");
 	assert.match(h.ui.selects[2].title, /^Through which step\? \(start: 3\)$/, "the end dialog names the pending start");
 	assert.deepEqual(
 		h.ui.selects[2].options.map((option) => option.split("  ")[0]),
-		["5", "4", "3"],
-		"only the valid ends are offered",
+		["10", "9", "8", "7", "6", "[4 - 5]", "3"],
+		"only the valid ends are offered, and the folded region's own end is one of them",
 	);
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /^Pinned \[3\] —/, "a single-step cut prints as [3]");
 
@@ -370,19 +399,19 @@ test("a bad fold argument fails loudly and pins nothing", async () => {
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /"x" is not a step number/);
 	assert.equal(h.pi.sentMessages.length, 0);
 
-	await h.runCommand("dmail", "fold 9");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 9 to fold from\. Starts: \[5, 4, 3, 2, 1\]\./);
+	await h.runCommand("dmail", "fold 99");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 99 to fold from\. Starts: \[10, 9, 8, 7, 6, 4, 3, 2, 1\]\./);
 	assert.equal(h.pi.sentMessages.length, 0);
 
 	// The end is validated the same way: a step that is not there is refused, and the
 	// refusal names the ends that are valid — the newest step among them, because
 	// nothing is running in this session.
 	await h.runCommand("dmail", "fold 2 x");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /"x" is not a step number\. Try \/dmail fold 2 5\./);
-	await h.runCommand("dmail", "fold 1 6");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /"x" is not a step number\. Try \/dmail fold 2 10\./);
+	await h.runCommand("dmail", "fold 1 11");
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/There is no step 6 to fold through\. Ends: \[5, 4, 3, 2, 1\]\./,
+		/There is no step 11 to fold through\. Ends: \[10, 9, 8, 7, 6, 5, 4, 3, 2, 1\]\./,
 		"a refusal names the ends that are valid",
 	);
 	assert.equal(h.pi.sentMessages.length, 0, "a refused range never reaches the agent");
@@ -392,16 +421,16 @@ test("while a round is running, the newest step is not foldable and says so", as
 	const h = await createHarness({ fixture: foldedFiveStepSession(), idle: false });
 	await h.start();
 
-	await h.runCommand("dmail", "fold 1 5");
+	await h.runCommand("dmail", "fold 1 10");
 	assert.match(
 		h.ui.notifications.at(-1)?.message ?? "",
-		/There is no step 5 to fold through\. Ends: \[4, 3, 2, 1\]\./,
+		/There is no step 10 to fold through\. Ends: \[9, 8, 7, 6, 5, 4, 3, 2, 1\]\./,
 		"the in-progress step is not among the ends while it is in progress",
 	);
 	assert.equal(h.pi.sentMessages.length, 0, "a refused range never reaches the agent");
 
-	await h.runCommand("dmail", "fold 5");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 5 to fold from\. Starts: \[4, 3, 2, 1\]\./);
+	await h.runCommand("dmail", "fold 10");
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /There is no step 10 to fold from\. Starts: \[9, 8, 7, 6, 4, 3, 2, 1\]\./);
 });
 
 test("the agent folds from exactly the pinned step and the user is told", async () => {
@@ -417,7 +446,7 @@ test("the agent folds from exactly the pinned step and the user is told", async 
 	// The agent authors the summary and performs the fold itself.
 	const summary = "Goal and constraints, venue booked, travel, invitations.";
 	const result = await h.execute({ fromStep: 1, summary });
-	assertFoldDetails(result, { fromStep: 1, throughStep: 4, fromEntryId: "e2", toEntryId: "e10" });
+	assertFoldDetails(result, { fromStep: 1, throughStep: 9, fromEntryId: "e1", toEntryId: "e10" });
 	assert.equal(h.pi.appended.length, 1);
 	assert.equal((h.pi.appended[0].data as { fromStep?: number }).fromStep, 1);
 
@@ -425,7 +454,7 @@ test("the agent folds from exactly the pinned step and the user is told", async 
 		h.ui.notifications.some(
 			(n) =>
 				n.message ===
-				"Folded steps 1–4. In effect from the next request. Folded on your behalf [1 - 4].",
+				"Folded steps 1–9. In effect from the next request. Folded on your behalf [1 - 9].",
 		),
 		"the user gets confirmation naming the range that was folded on their behalf",
 	);
@@ -462,11 +491,11 @@ test("/send-dmail is an alias of /dmail fold: same picker, same pin path", async
 	assert.equal(h.pi.sentMessages.length, 1);
 	assert.match(
 		messageText(h.pi.sentMessages[0].content),
-		/pinned the cut: fold from step 1 through step 5/,
+		/pinned the cut: fold from step 1 through step 10/,
 		"nothing is running, so the newest step is the default end",
 	);
 	assert.equal(h.pi.sentMessages[0].options?.deliverAs, undefined, "idle → plain send");
-	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 5\]/);
+	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Pinned \[1 - 10\]/);
 });
 
 test("/send-dmail pins an explicit start without a picker; busy → followUp", async () => {
@@ -478,11 +507,11 @@ test("/send-dmail pins an explicit start without a picker; busy → followUp", a
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /Try \/send-dmail 2\./);
 	assert.equal(h.pi.sentMessages.length, 0);
 
-	await h.runCommand("send-dmail", "3");
+	await h.runCommand("send-dmail", "6");
 
 	assert.equal(h.pi.sentMessages.length, 1);
 	assert.equal(h.pi.sentMessages[0].options?.deliverAs, "followUp", "busy agent → followUp delivery");
-	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 3 through step 4/);
+	assert.match(messageText(h.pi.sentMessages[0].content), /fold from step 6 through step 9/);
 	assert.match(h.ui.notifications.at(-1)?.message ?? "", /finishes the current turn/);
 });
 
@@ -510,11 +539,11 @@ test("a tool-call step previews like /tree: <tool_name>: <params>", async () => 
 	const labels = (await captureRows(h)).map((row) => row.label);
 	assert.deepEqual(
 		labels.map((label) => label.split("  ")[0]),
-		["3", "2", "1"],
-		"with nothing running every step folds, the newest included",
+		["6", "5", "4", "3", "2", "1"],
+		"with nothing running every turn folds, the newest included, questions too",
 	);
 	assert.ok(
-		labels[1].startsWith('2  assistant: Bash: {"command":"ls -la"}'),
-		`the tool-call step carries its call instead of a blank peek: ${labels[1]}`,
+		labels[2].startsWith('4  assistant: Bash: {"command":"ls -la"}'),
+		`the tool-call step carries its call instead of a blank peek: ${labels[2]}`,
 	);
 });

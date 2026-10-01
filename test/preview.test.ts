@@ -84,12 +84,12 @@ test("preview reports the fold's numbers but appends nothing and leaves the view
 	assert.equal(h.fixture.entries.length, 6, "no entry was written");
 	assert.equal(h.pi.sentMessages.length, 0, "the agent was not involved");
 
-	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 	assert.equal(details.preview, true, "the result says it is a preview");
 	assert.ok(details.economics.removedTokens > 0, "the estimate is real");
 
 	// Raw fallback content names the commitment — and the absence of one.
-	assert.match(preview.content[0].text, /^Preview: steps 1 through 2 would be replaced/);
+	assert.match(preview.content[0].text, /^Preview: steps 1 through 5 would be replaced/);
 	assert.match(preview.content[0].text, /Nothing was appended/);
 	assert.match(preview.content[0].text, /tokens removed/);
 	assert.match(preview.content[0].text, /cache: /);
@@ -103,8 +103,8 @@ test("a preview and a real fold over identical inputs report the same numbers", 
 	const preview = await h.execute({ fromStep: 1, summary: SUMMARY, preview: true });
 	const real = await h.execute({ fromStep: 1, summary: SUMMARY });
 
-	const previewDetails = assertFoldDetails(preview, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
-	const realDetails = assertFoldDetails(real, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const previewDetails = assertFoldDetails(preview, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
+	const realDetails = assertFoldDetails(real, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 	assert.deepEqual(previewDetails.economics, realDetails.economics, "identical economics");
 
 	// Everything after the headline — the advisory and skip count — is byte-identical.
@@ -120,7 +120,7 @@ test("a preview and a real fold over identical inputs report the same numbers", 
 
 	// The rendered form carries the same numbers, under a preview headline.
 	const rendered = h.render(preview, { args: { fromStep: 1, summary: SUMMARY } }).text();
-	assert.match(rendered, /Would fold steps 1–2/);
+	assert.match(rendered, /Would fold steps 1–5/);
 	assert.ok(rendered.includes(foldEconomicsLine(previewDetails)), "same economics line when rendered");
 });
 
@@ -146,13 +146,13 @@ test("preview refuses exactly what the fold refuses — and vice versa", async (
 
 	// The step you are in: nothing finished after it.
 	assert.equal(
-		await errorOf(h.execute({ fromStep: 3, summary: SUMMARY, preview: true })),
-		await errorOf(h.execute({ fromStep: 3, summary: SUMMARY })),
+		await errorOf(h.execute({ fromStep: 6, summary: SUMMARY, preview: true })),
+		await errorOf(h.execute({ fromStep: 6, summary: SUMMARY })),
 		"current step: identical refusal",
 	);
 	assert.match(
-		await errorOf(h.execute({ fromStep: 3, summary: SUMMARY, preview: true })),
-		/Step 3 is the step you are in/,
+		await errorOf(h.execute({ fromStep: 6, summary: SUMMARY, preview: true })),
+		/Step 6 is the step you are in/,
 	);
 
 	// Neither a preview nor a fold got through: nothing was appended or changed.
@@ -163,10 +163,10 @@ test("preview refuses exactly what the fold refuses — and vice versa", async (
 test("a start folded out of view is refused identically by preview and fold", async () => {
 	// A fold early, then a compaction whose boundary pushes that fold's step out
 	// of the view: step 1 exists on the branch but is no longer addressable.
-	const fx = threeStepSession(); // e1..e6, steps 1–3
-	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "orphan summary", fromStep: 1 }); // e7
-	fx.user("fourth question"); // e8
-	fx.assistant("fourth answer"); // e9, step 4
+	const fx = threeStepSession(); // e1..e6, steps 1–6
+	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "orphan summary", fromStep: 2 }); // e7
+	fx.user("fourth question"); // e8, step 7
+	fx.assistant("fourth answer"); // e9, step 8
 	fx.compaction({ summary: "earlier work", firstKeptEntryId: "e8" }); // e10
 	const h = await createHarness({ fixture: fx });
 	await h.start();
@@ -191,15 +191,15 @@ test("/dmail price prints estimates for every candidate cut and folds nothing", 
 
 	const message = lastNotification(h);
 	assert.match(message, /Candidate cuts/);
-	// Nothing is running, so every step is a candidate and every cut runs to the newest
-	// step: from 3, from 2, from 1. The tiny fixture archive can be smaller than any real
-	// memo, so the economics line may honestly read "added" — what matters is that it
-	// reports, never gates.
-	assert.match(message, /Would fold step 3/);
-	assert.match(message, /Would fold steps 2–3/);
-	assert.match(message, /Would fold steps 1–3/);
+	// Nothing is running, so every turn is a candidate — a question is a cut as much as
+	// an answer — and every cut runs to the newest step: from 6 down to from 1. The tiny
+	// fixture archive can be smaller than any real memo, so the economics line may
+	// honestly read "added" — what matters is that it reports, never gates.
+	assert.match(message, /Would fold step 6/);
+	assert.match(message, /Would fold steps 5–6/);
+	assert.match(message, /Would fold steps 1–6/);
 	assert.ok(
-		message.indexOf("Would fold step 3") < message.indexOf("Would fold steps 1–3"),
+		message.indexOf("Would fold step 6") < message.indexOf("Would fold steps 1–6"),
 		"the newest cut is listed first, like every other list a fold reads",
 	);
 	assert.match(message, /tokens (removed|added)/);
@@ -216,9 +216,9 @@ test("/dmail price with a round in flight prices the cuts that end before it", a
 
 	const message = lastNotification(h);
 	// The newest step is the round in progress, so no candidate starts or ends there.
-	assert.match(message, /Would fold steps 1–2/);
-	assert.match(message, /Would fold step 2/);
-	assert.doesNotMatch(message, /Would fold step 3/, "the in-progress step is not a candidate while it runs");
+	assert.match(message, /Would fold steps 1–5/);
+	assert.match(message, /Would fold step 5/);
+	assert.doesNotMatch(message, /step 6/, "the in-progress step is not a candidate while it runs");
 	// Each cut keeps that round, so the rebuild is knowable and the verdict is real.
 	assert.doesNotMatch(message, /rebuild unknowable/, "a cut that keeps a step can price its rebuild");
 });
@@ -245,17 +245,18 @@ test("a cut that runs to the newest step says its rebuild is unknowable, and a c
 	const idleMessage = lastNotification(idleRun);
 	assert.match(idleMessage, /cache: unknown \(rebuild unknowable\)/, "nothing follows an open-ended cut yet");
 	// Every candidate ends at the newest step, so every row is open-ended: a list where
-	// only the last one is would mean the other two were priced with a kept suffix.
+	// only the last one is would mean the others were priced with a kept suffix. There
+	// are six — one per turn, questions included.
 	assert.equal(
 		(idleMessage.match(/rebuild unknowable/g) ?? []).length,
-		3,
-		"all three open-ended candidates report an unknowable rebuild",
+		6,
+		"all six open-ended candidates report an unknowable rebuild",
 	);
 
 	const busyRun = await createHarness({ fixture: bigSession(), idle: false });
 	await busyRun.start();
 	stubUsage(busyRun);
-	await busyRun.runCommand("dmail", "price 1 2");
+	await busyRun.runCommand("dmail", "price 1 3");
 	const busyMessage = lastNotification(busyRun);
 	assert.doesNotMatch(busyMessage, /rebuild unknowable/, "a cut that keeps the next step can price its rebuild");
 });
@@ -268,7 +269,7 @@ test("/dmail price <step> with the same inputs prints the numbers preview would"
 	stubUsage(h);
 
 	const preview = await h.execute({ fromStep: 1, summary: SUMMARY, preview: true });
-	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 
 	await h.runCommand("dmail", `price 1 ${SUMMARY}`);
 
@@ -277,7 +278,7 @@ test("/dmail price <step> with the same inputs prints the numbers preview would"
 		message.includes(foldEconomicsLine(details)),
 		`price prints the preview's numbers:\n${message}\nvs\n${foldEconomicsLine(details)}`,
 	);
-	assert.match(message, /Would fold steps 1–2/);
+	assert.match(message, /Would fold steps 1–5/);
 	assert.equal(h.pi.appended.length, 0, "still no fold");
 	assert.equal(h.pi.sentMessages.length, 0, "the agent was not involved");
 });
@@ -288,7 +289,7 @@ test("/dmail price <start> <end> prints the figures for exactly the range the fo
 	stubUsage(h);
 
 	const preview = await h.execute({ fromStep: 1, throughStep: 1, summary: SUMMARY, preview: true });
-	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 1, fromEntryId: "e2", toEntryId: "e4" });
+	const details = assertFoldDetails(preview, { fromStep: 1, throughStep: 1, fromEntryId: "e1", toEntryId: "e2" });
 
 	await h.runCommand("dmail", `price 1 1 ${SUMMARY}`);
 
@@ -306,11 +307,11 @@ test("/dmail price <start> <end> reports the fold's own refusal for an end that 
 	const h = await createHarness({ fixture: threeStepSession() });
 	await h.start();
 
-	await h.runCommand("dmail", "price 1 4");
+	await h.runCommand("dmail", "price 1 7");
 
 	const note = h.ui.notifications.at(-1);
 	assert.equal(note?.type, "error");
-	assert.match(note?.message ?? "", /There is no step 4 to fold through\. Ends: \[3, 2, 1\]\./);
+	assert.match(note?.message ?? "", /There is no step 7 to fold through\. Ends: \[6, 5, 4, 3, 2, 1\]\./);
 	assert.equal(h.pi.appended.length, 0, "no fold record on a refused range");
 });
 
@@ -318,11 +319,11 @@ test("/dmail price refuses the newest step as an end while a round is in flight"
 	const h = await createHarness({ fixture: threeStepSession(), idle: false });
 	await h.start();
 
-	await h.runCommand("dmail", "price 1 3");
+	await h.runCommand("dmail", "price 1 6");
 
 	const note = h.ui.notifications.at(-1);
 	assert.equal(note?.type, "error", "an end that is not one is an error, not a priced cut");
-	assert.match(note?.message ?? "", /There is no step 3 to fold through\. Ends: \[2, 1\]\./);
+	assert.match(note?.message ?? "", /There is no step 6 to fold through\. Ends: \[5, 4, 3, 2, 1\]\./);
 });
 
 test("/dmail price reports the fold's validation errors instead of folding", async () => {
@@ -338,12 +339,26 @@ test("/dmail price reports the fold's validation errors instead of folding", asy
 	assert.equal(h.fixture.entries.length, 6, "no entry was written");
 });
 
-test("/dmail price says so when nothing is finished to fold", async () => {
+test("/dmail price still prices the lone request when nothing else is foldable", async () => {
 	const fx = new SessionFixture();
 	fx.user("only question");
 	fx.assistant("only answer");
-	// In flight: on an idle session that one step is itself foldable, so there would be
-	// a candidate to print. This test is about having nothing to fold at all.
+	// In flight: the answer is the round being written, so the request it answers is
+	// the only cut left. It is priced like any other step.
+	const h = await createHarness({ fixture: fx, idle: false });
+	await h.start();
+
+	await h.runCommand("dmail", "price");
+	assert.match(lastNotification(h), /Would fold step 1/, "the one cut left is the request");
+	assert.equal(h.pi.appended.length, 0);
+	assert.equal(h.pi.sentMessages.length, 0);
+});
+
+test("/dmail price says so when there is nothing to fold at all", async () => {
+	// A request nobody has answered: it is the round in progress, so there is no
+	// candidate either — and the list says so rather than printing an empty one.
+	const fx = new SessionFixture();
+	fx.user("a request nobody has answered yet");
 	const h = await createHarness({ fixture: fx, idle: false });
 	await h.start();
 
@@ -355,18 +370,18 @@ test("/dmail price says so when nothing is finished to fold", async () => {
 
 test("preview and price report the same skipped-record count", async () => {
 	// A fold record orphaned by a later compaction: replay counts it as skipped.
-	const fx = threeStepSession(); // e1..e6, steps 1–3
-	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "early fold", fromStep: 1 }); // e7
-	fx.user("fourth question"); // e8
-	fx.assistant("fourth answer"); // e9, step 4
-	fx.user("fifth question"); // e10
-	fx.assistant("fifth answer"); // e11, step 5
+	const fx = threeStepSession(); // e1..e6, steps 1–6
+	fx.foldRecord({ fromEntryId: "e2", toEntryId: "e6", summary: "early fold", fromStep: 2 }); // e7
+	fx.user("fourth question"); // e8, step 7
+	fx.assistant("fourth answer"); // e9, step 8
+	fx.user("fifth question"); // e10, step 9
+	fx.assistant("fifth answer"); // e11, step 10
 	fx.compaction({ summary: "earlier work", firstKeptEntryId: "e8" }); // e12
 	const h = await createHarness({ fixture: fx });
 	await h.start();
 	stubUsage(h);
 
-	const preview = await h.execute({ fromStep: 4, summary: "Later work", preview: true });
+	const preview = await h.execute({ fromStep: 8, summary: "Later work", preview: true });
 	assert.match(preview.content[0].text, /folds skipped: 1/, "preview counts the orphaned record");
 
 	await h.runCommand("dmail", "price");
@@ -384,11 +399,11 @@ test("the preview render is unmistakably not a fold", async () => {
 
 	assert.doesNotMatch(rendered, /^✓/, "no success checkmark: nothing succeeded yet");
 	assert.match(rendered, /preview/);
-	assert.match(rendered, /Would fold steps 1–2/);
+	assert.match(rendered, /Would fold steps 1–5/);
 	assert.match(rendered, /tokens removed/, "the advisory still renders");
 
 	// The real fold keeps its old look.
 	const real = await h.execute({ fromStep: 1, summary: SUMMARY });
 	const realRendered = h.render(real, { args: { fromStep: 1, summary: SUMMARY } }).text();
-	assert.match(realRendered, /^✓ Folded steps 1–2/);
+	assert.match(realRendered, /^✓ Folded steps 1–5/);
 });

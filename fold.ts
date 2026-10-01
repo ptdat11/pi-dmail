@@ -57,7 +57,7 @@ export interface EntryLike {
 }
 
 export interface NumberedStep {
-	/** 1-based, stable for the life of the branch. */
+	/** 1-based, stable for the life of the branch. One step is one message turn. */
 	step: number;
 	entryId: string;
 	/** Index into the entry list the numbering was derived from. */
@@ -104,6 +104,11 @@ export interface FoldOptions<E, M> {
 	/**
 	 * Which entries begin a step. When supplied, a fold is refused unless both of
 	 * its endpoints begin a step.
+	 *
+	 * A step is one message turn — the user's or the assistant's — and both are
+	 * safe boundaries: a request is followed by an answer, and only an assistant
+	 * message is followed by the tool results it asked for. So a tool result is
+	 * the one entry a fold may never start or stop at.
 	 *
 	 * This is what makes the pairing invariant structural rather than
 	 * conventional. Dropping `[from, to)` is safe exactly when `from` and `to` are

@@ -88,16 +88,22 @@ export function endStepOf(row: FoldPickerRow): number {
  * too, because the round that does the folding is a step start after it.
  * One predicate on the caller's view, so the fold's refusal, the headless hint,
  * and the picker's dimmed rows cannot drift apart (tickets 12 and 13).
+ *
+ * `regionEnds` carries folded regions' own ends. A region's last step is a step
+ * start whose entry is gone, so stopping there is exactly "the whole region goes",
+ * and the region's row offers it — but no visible step names it, so it has to be
+ * named here or that row would be an end the fold refuses.
  */
 export function validEnds(
 	steps: readonly NumberedStep[],
 	current: NumberedStep | undefined,
 	fromStep: number,
+	regionEnds: readonly number[] = [],
 ): number[] {
-	return steps
-		.filter((step) => step.step >= fromStep && (current === undefined || step.step < current.step))
-		.map((step) => step.step)
-		.reverse();
+	const foldable = (step: number) => step >= fromStep && (current === undefined || step < current.step);
+	const ends = new Set(steps.filter((step) => foldable(step.step)).map((step) => step.step));
+	for (const end of regionEnds) if (foldable(end)) ends.add(end);
+	return [...ends].sort((a, b) => b - a);
 }
 
 /**

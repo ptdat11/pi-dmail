@@ -207,7 +207,7 @@ function foldPinPrompt(
 const FALLBACK_POLICY = [
 	"You have a `send_dmail` tool: it folds a range of finished steps out of your context and replaces them with a summary you write.",
 	"Fold a step as soon as you have taken what you need from it and will not need to read it again. Do not wait for a phase boundary.",
-	"Steps are numbered in the conversation as `[step N]`. Pass the earliest step you are done with as `fromStep`.",
+	"Steps are numbered in the conversation as `[step N]`, one per message turn — the user's and yours. Pass the earliest step you are done with as `fromStep`.",
 	"Pass `throughStep` (inclusive) to stop the fold before the last completed step; omit it to fold through the last completed step.",
 ].join("\n");
 
@@ -229,8 +229,56 @@ function isAssistantEntry(entry: SessionEntry): boolean {
 	return entry.type === "message" && entry.message.role === "assistant";
 }
 
+/**
+ * What a step is: one message turn, the user's or the assistant's.
+ *
+ * Both are boundaries because both are places a fold may cut without splitting a
+ * tool call from its result — a request and its answer each end at a message, and
+ * only the assistant's message is followed by the tool results it asked for. A
+ * `toolResult` entry is deliberately *not* a boundary: it is the one entry whose
+ * assistant must never end up on the other side of the cut from it.
+ *
+ * Numbering both is what lets the user fold their own request away. A request that
+ * carries no number has no marker, no picker row, and no way to be named at all —
+ * which is why folding had to reach for a synthetic "step 0" to touch the opening
+ * message, and why that reached exactly one message.
+ */
+function isStepEntry(entry: SessionEntry): boolean {
+	return entry.type === "message" && (entry.message.role === "user" || isAssistantEntry(entry));
+}
+
 function stepsIn(entries: readonly SessionEntry[]): NumberedStep[] {
-	return numberSteps(entries, isAssistantEntry);
+	return numberSteps(entries, isStepEntry);
+}
+
+/**
+ * The ends that folded regions contribute: each region's own last step.
+ *
+ * A region is not in view, but its last step is a step start whose entry is gone, so
+ * a fold may legally stop there — that is what "the whole region goes into this cut"
+ * means, and what the picker's region row offers as an end. With one numbering for
+ * every turn a region spans a question and its answer, so this end is rarely a number
+ * any visible step still carries; without it, the row would be a dead end.
+ */
+function regionEndsOf(plan: ReplayPlan, branchSteps: readonly NumberedStep[]): number[] {
+	const stepOf = new Map(branchSteps.map((step) => [step.entryId, step.step]));
+	const ends: number[] = [];
+	for (const fold of plan.inEra) {
+		// The record's exclusive end is the next step start, so the region's last step
+		// is the one just before it.
+		const after = stepOf.get(fold.toEntryId);
+		if (after !== undefined) ends.push(after - 1);
+	}
+	return ends;
+}
+
+/**
+ * The fold's range in the sentence the agent reads. It spells "through" out rather
+ * than using the front end's dash, because this is a claim about a range rather
+ * than a label for one.
+ */
+function rangePhrase(fromStep: number, throughStep: number): string {
+	return `steps ${fromStep} through ${throughStep}`;
 }
 
 function userMessage(text: string, timestamp: number): AgentMessage {
@@ -304,7 +352,7 @@ function readFolds(entries: readonly SessionEntry[]): LocatedFold[] {
  * planned separately, one could report a number the others do not agree with.
  */
 function planForView(entries: readonly SessionEntry[], branch: readonly SessionEntry[]): ReplayPlan {
-	return planReplay(entries, readFolds(branch), { isStepStart: isAssistantEntry });
+	return planReplay(entries, readFolds(branch), { isStepStart: isStepEntry });
 }
 
 /**
@@ -428,26 +476,30 @@ function resolveEnd(
 	target: NumberedStep,
 	throughStep: number | undefined,
 	inFlight: NumberedStep,
+	regionEnds?: readonly number[],
 ): { to: NumberedStep; through: number };
 function resolveEnd(
 	visibleSteps: readonly NumberedStep[],
 	target: NumberedStep,
 	throughStep: number | undefined,
 	inFlight: undefined,
+	regionEnds?: readonly number[],
 ): { to: NumberedStep | undefined; through: number };
 function resolveEnd(
 	visibleSteps: readonly NumberedStep[],
 	target: NumberedStep,
 	throughStep: number | undefined,
 	inFlight: NumberedStep | undefined,
+	regionEnds?: readonly number[],
 ): { to: NumberedStep | undefined; through: number };
 function resolveEnd(
 	visibleSteps: readonly NumberedStep[],
 	target: NumberedStep,
 	throughStep: number | undefined,
 	inFlight: NumberedStep | undefined,
+	regionEnds: readonly number[] = [],
 ): { to: NumberedStep | undefined; through: number } {
-	const ends = validEnds(visibleSteps, inFlight, target.step);
+	const ends = validEnds(visibleSteps, inFlight, target.step, regionEnds);
 	if (ends.length === 0) {
 		// Only reachable with a step in progress: with none, `target` is a visible step
 		// and is therefore an end of itself.
@@ -535,10 +587,16 @@ function planFold(
 	// that round as the step in flight and its range is closed by type; only the command
 	// side, where nothing is running, may stop at the newest step and keep nothing.
 	if (openEnd) {
-		const open = resolveEnd(visibleSteps, target, throughStep, undefined);
+		const open = resolveEnd(visibleSteps, target, throughStep, undefined, regionEndsOf(plan, branchSteps));
 		return estimateFold(entries, target, open.to, open.through, trimmed, skipped.length, ctx);
 	}
-	const { to, through } = resolveEnd(visibleSteps, target, throughStep, visibleSteps[visibleSteps.length - 1]);
+	const { to, through } = resolveEnd(
+		visibleSteps,
+		target,
+		throughStep,
+		visibleSteps[visibleSteps.length - 1],
+		regionEndsOf(plan, branchSteps),
+	);
 	return estimateFold(entries, target, to, through, trimmed, skipped.length, ctx);
 }
 
@@ -651,12 +709,14 @@ function priceCommand(ctx: ExtensionContext, rest: string): void {
 			ctx.ui.notify("Nothing finished to fold yet: the step you are in has nothing after it.", "info");
 			return;
 		}
-		const { skipped } = planForView(entries, branch);
+		const plan = planForView(entries, branch);
+		const { skipped } = plan;
+		const regionEnds = regionEndsOf(plan, stepsIn(branch));
 		// Each candidate is priced at the end the fold would itself freeze for it, so the
 		// headline and the figures describe the cut that would actually happen — not an
 		// arithmetic guess a folded-away step turns into a step that is not there.
 		const plans = candidates.map((target) => {
-			const end = resolveEnd(visibleSteps, target, undefined, inFlight);
+			const end = resolveEnd(visibleSteps, target, undefined, inFlight, regionEnds);
 			return estimateFold(entries, target, end.to, end.through, PRICE_SUMMARY_SAMPLE, skipped.length, ctx);
 		});
 		const rows = plans.map(
@@ -835,7 +895,8 @@ export default function dmail(pi: ExtensionAPI): void {
 		};
 		// The ends a fold from this start may stop at, latest first — the very list the
 		// fold's own endpoint validation reads, so a refusal never names a refused step.
-		const endsFrom = (fromStep: number): number[] => validEnds(visible, inFlight, fromStep);
+		const endsFrom = (fromStep: number): number[] =>
+			validEnds(visible, inFlight, fromStep, regionEndsOf(plan, stepsIn(branch)));
 		// A number to suggest when an end was missing or unparseable: the end this start
 		// would have taken by default, or the latest foldable step if it has none.
 		const endsHint = (fromStep: number): number => endsFrom(fromStep)[0] ?? latestFinished;
@@ -1047,7 +1108,7 @@ export default function dmail(pi: ExtensionAPI): void {
 					// A stable timestamp keeps the marker byte-identical across requests.
 					return userMessage(`[step ${step}]`, Date.parse(entry.timestamp) || Date.now());
 				},
-				isStepStart: isAssistantEntry,
+				isStepStart: isStepEntry,
 			});
 
 			if (!result.changed || result.messages.length === 0) return undefined;
@@ -1095,7 +1156,7 @@ export default function dmail(pi: ExtensionAPI): void {
 			const replay = foldContext<SessionEntry, string>(era, plan.inEra, {
 				convert: () => [],
 				summaryMessage: (_wrappedText, fold) => fold.summary,
-				isStepStart: isAssistantEntry,
+				isStepStart: isStepEntry,
 			});
 			if (replay.messages.length === 0) return undefined;
 
@@ -1135,7 +1196,9 @@ export default function dmail(pi: ExtensionAPI): void {
 		promptSnippet: "send_dmail — fold finished steps out of context, replacing them with a summary you write",
 		parameters: Type.Object({
 			fromStep: Type.Number({
-				description: "Number of the earliest step to fold, as shown by the [step N] markers.",
+				description:
+					"Number of the earliest step to fold, as shown by the [step N] markers. " +
+					"A step is one message turn: the user's and the assistant's alike.",
 			}),
 			throughStep: Type.Optional(
 				Type.Number({
@@ -1198,7 +1261,7 @@ export default function dmail(pi: ExtensionAPI): void {
 			// same advisory — nothing appended, no notification, the view untouched.
 			if (params.preview) {
 				const headline =
-					`Preview: steps ${target.step} through ${through} would be replaced by your summary ` +
+					`Preview: ${rangePhrase(target.step, through)} would be replaced by your summary ` +
 					`from the next request on. Nothing was appended — the view is unchanged.`;
 				return {
 					content: [{ type: "text" as const, text: [headline, ...tail].join("\n") }],
@@ -1243,7 +1306,7 @@ export default function dmail(pi: ExtensionAPI): void {
 				// Ignore.
 			}
 
-			const headline = `Folded steps ${target.step} through ${through}. They are replaced by your summary from the next request on.`;
+			const headline = `Folded ${rangePhrase(target.step, through)}. They are replaced by your summary from the next request on.`;
 			return {
 				content: [{ type: "text" as const, text: [headline, ...tail].join("\n") }],
 				details,

@@ -29,14 +29,14 @@ test("fold result carries estimated tokens removed and the cache verdict", async
 
 	const summary = "Opening exchange";
 	const result = await h.execute({ fromStep: 1, summary });
-	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 
 	assert.equal(h.pi.appended.length, 1, "the fold happened");
 	assert.ok(details.economics.removedTokens > 0, "archive is larger than the memo");
 	assert.equal(typeof details.economics.cacheVerdict, "string", "cache verdict present");
 
 	// Raw fallback content names the economics without any render hook.
-	assert.match(result.content[0].text, /^Folded steps 1 through 2\./);
+	assert.match(result.content[0].text, /^Folded steps 1 through 5\./);
 	assert.match(result.content[0].text, /tokens removed/);
 	assert.match(result.content[0].text, /cache: /);
 
@@ -57,7 +57,7 @@ test("window headroom warns as context approaches the reserve — and never bloc
 	});
 	const nearResult = await near.execute({ fromStep: 1, summary: "Opening exchange" });
 	assert.equal(near.pi.appended.length, 1, "fold still succeeds");
-	const nearDetails = assertFoldDetails(nearResult, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const nearDetails = assertFoldDetails(nearResult, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 	assert.equal(nearDetails.economics.headroom.nearReserve, true);
 	assert.match(nearResult.content[0].text, /window headroom ~20k — within one 16\.4k reserve/);
 
@@ -71,7 +71,7 @@ test("window headroom warns as context approaches the reserve — and never bloc
 	});
 	const insideResult = await inside.execute({ fromStep: 1, summary: "Opening exchange" });
 	assert.equal(inside.pi.appended.length, 1, "fold still succeeds inside the reserve");
-	const insideDetails = assertFoldDetails(insideResult, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const insideDetails = assertFoldDetails(insideResult, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 	assert.equal(insideDetails.economics.headroom.insideReserve, true);
 	assert.match(insideResult.content[0].text, /window headroom ~15k — inside the 16\.4k reserve/);
 });
@@ -84,7 +84,7 @@ test("a throwing usage probe degrades the advisory, never the fold", async () =>
 	};
 
 	const result = await h.execute({ fromStep: 1, summary: "Opening exchange" });
-	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 2, fromEntryId: "e2", toEntryId: "e6" });
+	const details = assertFoldDetails(result, { fromStep: 1, throughStep: 5, fromEntryId: "e1", toEntryId: "e6" });
 
 	assert.equal(h.pi.appended.length, 1, "the fold happened anyway");
 	assert.equal(details.economics.headroom.contextTokens, null, "headroom unknown, not fatal");
