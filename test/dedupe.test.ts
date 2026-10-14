@@ -93,6 +93,22 @@ test("the result keeps the headline and the advisory, and drops the skip count",
 	assert.ok(!text.includes("folds skipped"), "the skip count is dropped: replay just re-decided it");
 });
 
+test("the trimmed result points back at the chip instead of the dropped argument", () => {
+	const economics = { removedTokens: 1200, estimatedSavingsTokens: 1100, cacheVerdict: "helpful" } as const;
+	const out = redactFoldCalls(
+		[call({ fromStep: 1, summary: SUMMARY }), result("tc1", { economics })],
+		{ toolName: "send_dmail", applied },
+	);
+	const text = textOf(out[1]);
+	const headline = text.indexOf("Folded steps 1");
+	const pointer = text.indexOf("replayed as the <summary> message above");
+	const advisory = text.indexOf("~1.2k tokens removed");
+	assert.ok(pointer >= 0, "the reference line is there: the summary was passed, and where it now lives");
+	assert.ok(headline >= 0 && headline < pointer, "after the headline");
+	assert.ok(advisory > pointer, "before the advisory");
+	assert.ok(!text.includes("Ran the suite"), "the reference names the chip, it does not re-send the body");
+});
+
 test("a preview has no chip, so its arguments stay the only copy", () => {
 	const preview = { fromStep: 1, throughStep: 4, summary: SUMMARY, preview: true };
 	const out = redactFoldCalls([call(preview, "tc9"), result("tc9", {}, "Preview: steps 1 through 4 …")], {
@@ -200,7 +216,9 @@ test("the replayed view carries the summary once, and the call only its range", 
 	const [context] = (await h.dispatch("context", { type: "context" }, h.ctx)) as any[];
 	const view = JSON.stringify(context.messages);
 
-	assert.equal((view.match(/<summary>/g) ?? []).length, 1, "one chip");
+	// Counted by the closing tag: the trimmed result *names* `<summary>` when it
+	// points at the chip, and that reference is not a second chip.
+	assert.equal((view.match(/<\/summary>/g) ?? []).length, 1, "one chip");
 	assert.equal((view.match(/Ran the suite/g) ?? []).length, 1, "the body appears once — in the chip");
 
 	const survived = context.messages.find((message: any) =>
@@ -209,4 +227,16 @@ test("the replayed view carries the summary once, and the call only its range", 
 	const call = survived.content.find((block: any) => block.name === "send_dmail");
 	assert.deepEqual(call.arguments, { fromStep: 1 }, "the surviving call carries only its range");
 	assert.ok(!view.includes("folds skipped"), "and its result lost the skip line");
+
+	const foldedResult = context.messages.find(
+		(message: any) => message.role === "toolResult" && message.toolCallId === callId,
+	);
+	assert.match(textOf(foldedResult), /<summary> message above/, "the result says where its argument went");
+
+	// The pointer says "above", so the chip really has to be earlier in the view.
+	const chipIndex = context.messages.findIndex((message: any) =>
+		/<\/summary>/.test(JSON.stringify(message.content ?? "")),
+	);
+	const callIndex = context.messages.indexOf(survived);
+	assert.ok(chipIndex >= 0 && chipIndex < callIndex, "the chip sits above the call that wrote it");
 });

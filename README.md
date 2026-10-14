@@ -39,8 +39,10 @@ a range of steps; theirs rewinds to a checkpoint.
 
 A fold is sent **once**. The step that folds is never inside its own range, so its `send_dmail` call
 stays in the view — and would carry the summary's body in its arguments on every request after it. The
-hook rewrites that call down to the range it folded and trims its result to the headline and the
-advisory, so the body lives in the `<summary>` chip alone. Calls are matched only against records that
+hook rewrites that call down to the range it folded and trims its result to the headline, a pointer to
+where the body went (the `<summary>` chip above), and the advisory, so the body lives in the chip alone.
+A reader that finds no `summary` argument is told the text was passed and replayed elsewhere, rather
+than left to conclude the fold never carried one. Calls are matched only against records that
 replayed *this* view: a preview and a refused fold injected no chip, so their arguments are the only
 copy and stay untouched. Nothing is removed from the session — the transcript still holds the full
 call, and expanding the result still shows the whole summary.

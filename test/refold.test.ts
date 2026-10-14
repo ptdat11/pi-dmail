@@ -35,8 +35,13 @@ async function contextMessages(h: Awaited<ReturnType<typeof createHarness>>): Pr
 	return (messages ?? []).map(messageText);
 }
 
+/**
+ * Chips in the view, counted by the closing tag: the trimmed result now *names*
+ * `<summary>` when it points at the chip, so the opening tag alone would count
+ * that pointer as a second memo.
+ */
 function summaryCount(messages: readonly string[]): number {
-	return messages.reduce((n, text) => n + (text.match(/<summary>/g)?.length ?? 0), 0);
+	return messages.reduce((n, text) => n + (text.match(/<\/summary>/g)?.length ?? 0), 0);
 }
 
 test("a re-fold from a start inside an existing fold region is refused, naming the marker that absorbs it", async () => {
@@ -102,7 +107,7 @@ test("a same-start re-fold replaces the older summary, not stacks it", async () 
 
 	const messages = await contextMessages(h);
 	assert.equal(summaryCount(messages), 1, "exactly one summary after replacing at the same start");
-	const summaryIndex = messages.findIndex((text) => text.includes("<summary>"));
+	const summaryIndex = messages.findIndex((text) => text.includes("</summary>"));
 	assert.ok(summaryIndex > 0, "a summary rendered");
 	assert.match(messages[summaryIndex], /better summary/);
 	assert.doesNotMatch(messages[summaryIndex], /first attempt/);

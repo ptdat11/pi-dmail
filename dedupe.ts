@@ -9,11 +9,17 @@
  * forgotten argument.
  *
  * This pass removes the second copy from the *replayed* context. It rewrites the
- * tool call down to the range it folded and trims its result to the headline and
- * the advisory lines, so what survives is the part the summary cannot say for
- * itself: which steps went, that the swap takes effect now, and whether the
- * window is closing. Nothing is deleted from the session — the stored transcript
- * still holds the full call, and `renderResult` still draws the whole summary.
+ * tool call down to the range it folded and trims its result to the headline, a
+ * one-line pointer to the chip, and the advisory lines, so what survives is the
+ * part the summary cannot say for itself: which steps went, that the swap takes
+ * effect now, where the body now lives, and whether the window is closing.
+ * Nothing is deleted from the session — the stored transcript still holds the
+ * full call, and `renderResult` still draws the whole summary.
+ *
+ * The pointer earns its place: once `summary` is out of the arguments, a result
+ * made only of the headline and the numbers reads like a fold whose summary
+ * never arrived. Naming the chip turns the missing argument into a move the
+ * model can follow instead of a failure it has to diagnose.
  *
  * Two invariants make it safe:
  *
@@ -182,12 +188,25 @@ function rewriteArguments(block: ToolCallView, claims: Map<string, number>): Arg
 }
 
 /**
- * The result of a folded call: the headline, then the advisory lines.
+ * One line naming where the body went.
+ *
+ * The rewritten call no longer carries `summary`, so the result has to say that
+ * the text was passed and where it is now. The chip is always *earlier* in the
+ * view than the call that wrote it — a fold only ever covers steps finished
+ * before the step doing the folding — which is what makes "above" true even
+ * when other messages sit between the two.
+ */
+const SUMMARY_REFERENCE = "your summary text was passed with this call and is replayed as the <summary> message above";
+
+/**
+ * The result of a folded call: the headline, the pointer, then the advisory lines.
  *
  * The headline says what went and that the swap takes effect now — the part the
- * summary chip cannot say for itself. The advisory (economics, window headroom)
- * rides along because it is the model's cue to keep folding. The skip count is
- * dropped: it counts *other* records, and replay has just re-decided those.
+ * summary chip cannot say for itself. The pointer names the chip as the body's
+ * new home, so a model reading the call without a `summary` still finds it. The
+ * advisory (economics, window headroom) rides along because it is the model's
+ * cue to keep folding. The skip count is dropped: it counts *other* records, and
+ * replay has just re-decided those.
  */
 function trimResult(message: MessageView): MessageView {
 	const content = message.content;
@@ -197,8 +216,9 @@ function trimResult(message: MessageView): MessageView {
 	const headline = firstLine(textOf(content[first]));
 	if (headline === "") return message;
 	const advisory = foldAdvisoryText((message.details ?? {}) as FoldRenderDetails);
+	const text = [headline, SUMMARY_REFERENCE, advisory].filter((line) => line !== "").join("\n");
 	const blocks = content.slice();
-	blocks[first] = { ...(blocks[first] as object), text: advisory === "" ? headline : `${headline}\n${advisory}` };
+	blocks[first] = { ...(blocks[first] as object), text };
 	return { ...message, content: blocks };
 }
 
