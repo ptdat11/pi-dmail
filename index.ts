@@ -576,7 +576,9 @@ function planFold(
 	if (midStart !== undefined) {
 		throw new Error(midStart);
 	}
-	const trimmed = summary.trim();
+	// A client that skips schema validation can deliver no summary at all; treat
+	// that as the empty case so it gets this message, not a TypeError.
+	const trimmed = typeof summary === "string" ? summary.trim() : "";
 	if (trimmed === "") {
 		throw new Error("The summary is empty. Write what should replace the folded steps.");
 	}
@@ -1189,10 +1191,11 @@ export default function dmail(pi: ExtensionAPI): void {
 		name: TOOL_NAME,
 		label: "Send D-Mail",
 		description:
-			"Fold a range of finished steps out of your context and replace them with a summary you write. " +
+			"Fold a finished run of steps out of your context. Every call needs `fromStep` and a non-empty " +
+			"`summary` — the memo that replaces the folded steps; there is no default summary. " +
 			"Everything from `fromStep` through `throughStep` (default: the last completed step) stops being sent; the step you are in is kept. " +
 			"Nothing is deleted from the session or from disk, so folding too much costs only a re-read. " +
-			"Pass `preview` to get the same estimates without folding.",
+			"Pass `preview` to get the same estimates without folding (it validates the summary too).",
 		promptSnippet: "send_dmail — fold finished steps out of context, replacing them with a summary you write",
 		parameters: Type.Object({
 			fromStep: Type.Number({
@@ -1208,7 +1211,9 @@ export default function dmail(pi: ExtensionAPI): void {
 				}),
 			),
 			summary: Type.String({
-				description: "What replaces the folded steps. Include everything later steps depend on.",
+				description:
+					"What replaces the folded steps. Required and must be non-empty. " +
+					"Include everything later steps depend on.",
 			}),
 			preview: Type.Optional(
 				Type.Boolean({
